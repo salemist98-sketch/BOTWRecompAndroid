@@ -52,6 +52,55 @@ jobs:
             ANDROID_NDK_LINUX="$ANDROID_HOME/ndk/$NDK_VERSION" bash android/deps/build_ffmpeg.sh
           fi
 
+      - name: Apply our changes (frame profiler switch)
+        run: |
+          cat > /tmp/prof-toggle.patch <<'PATCH_EOF'
+          diff --git a/runtime/nvn/vulkan/exec.c b/runtime/nvn/vulkan/exec.c
+          index a7afd32..c5d20a8 100644
+          --- a/runtime/nvn/vulkan/exec.c
+          +++ b/runtime/nvn/vulkan/exec.c
+          @@ -1469,2 +1469,5 @@ void vk_exec_init(void) {
+               prof = getenv("LARECOMP_VK_PROF") != NULL;
+          +#ifdef __ANDROID__
+          +    if (g_settings.vk_prof) prof = 1;  // (the start screen's Settings > Prelaunch > Frame profiler)
+          +#endif
+           #ifdef __ANDROID__
+          diff --git a/runtime/settings.c b/runtime/settings.c
+          index 5cdcdbb..4a762d7 100644
+          --- a/runtime/settings.c
+          +++ b/runtime/settings.c
+          @@ -276,2 +276,3 @@ void settings_load(void) {
+                   else if (!strcmp(key, "log_file")) g_settings.log_file = atoi(val) != 0;
+          +        else if (!strcmp(key, "vk_prof")) g_settings.vk_prof = atoi(val) != 0;
+                   else if (!strcmp(key, "gpu_model")) snprintf(g_settings.gpu_model, sizeof g_settings.gpu_model, "%s", val);
+          @@ -384,2 +385,3 @@ void settings_save(void) {
+               fprintf(f, "driver_env = %s\nheap_file = %d\n", g_settings.driver_env, g_settings.heap_file);
+          +    fprintf(f, "vk_prof = %d\n", g_settings.vk_prof);
+           #undef TRI
+          diff --git a/runtime/settings.h b/runtime/settings.h
+          index 1094345..37fe46e 100644
+          --- a/runtime/settings.h
+          +++ b/runtime/settings.h
+          @@ -58,2 +58,3 @@ typedef struct {
+               bool log_file;        // the log in a file as well (platform/android.c), to send with a report
+          +    bool vk_prof;         // the frame profiler (vulkan/exec.c, LARECOMP_VK_PROF): where each frame's CPU time goes, in the log; read when the game starts
+               char gpu_model[64];   // the GPU of the last start ("Adreno (TM) 830v1"): turnip_lrz's Automatic, before the driver
+          diff --git a/runtime/ui/launcher.mm b/runtime/ui/launcher.mm
+          index c15eef9..553e7a5 100644
+          --- a/runtime/ui/launcher.mm
+          +++ b/runtime/ui/launcher.mm
+          @@ -1658,2 +1658,8 @@ static void prelaunch_tab(float sc) {
+                   ImGui::PopID();
+          +        ImGui::Spacing();
+          +        if (ImGui::Checkbox(tr("Frame profiler"), &g_settings.vk_prof)) changed = true;
+          +        ImGui::TextDisabled("%s", tr("Adds to the log where each frame's time goes (draw setup, pipelines, descriptor sets, "
+          +                                  "textures, vertices, GPU) and lists every frame over 50 ms. It slows the game a "
+          +                                  "little and makes the log longer: for bug reports only. Applies the next time the "
+          +                                  "game starts."));
+                   ImGui::PopTextWrapPos();
+          PATCH_EOF
+          git apply --verbose /tmp/prof-toggle.patch
+
       - name: Make this a separate app (so your installed one is not replaced)
         run: |
           sed -i 's|applicationId = "com.botwrecomp.android"|applicationId = "com.botwrecomp.android.test"|' android/botwrecompandroid/app/build.gradle.kts
@@ -69,4 +118,3 @@ jobs:
           name: botw-apk
           path: android/botwrecompandroid/app/build/outputs/apk/release/*.apk
           if-no-files-found: error
-          
