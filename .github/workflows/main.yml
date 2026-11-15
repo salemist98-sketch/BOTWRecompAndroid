@@ -106,6 +106,17 @@ jobs:
           s = s[:j] + '#ifdef __ANDROID__\n    fprintf(f, "vk_prof = %d\\n", g_settings.vk_prof);\n#endif\n' + s[j:]
           open(p, 'w', encoding='utf-8').write(s)
           PY_EOF
+          # the frame profiler also asks for the GPU time per pass of one frame in 600 (the "[gpuprof]" lines)
+          python3 - <<'PY_EOF2'
+          p = 'runtime/nvn/vulkan/device.c'
+          s = open(p, encoding='utf-8').read()
+          old = 'const char *e = getenv("LARECOMP_GPUPROF_AT");'
+          assert s.count(old) == 1, 'GPUPROF_AT line not found exactly once'
+          i = s.index(old)
+          ins = '#ifdef __ANDROID__\n        if (g_settings.vk_prof && total_frames % 600 == 300) g_gpuprof_frame = true;\n#endif\n        '
+          s = s[:i] + ins + s[i:]
+          open(p, 'w', encoding='utf-8').write(s)
+          PY_EOF2
           git diff --stat
 
       - name: Make this a separate app (so your installed one is not replaced)
