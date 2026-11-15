@@ -16,6 +16,12 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Save a copy of the current source (for review)
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-source
+          path: runtime
+
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
@@ -124,6 +130,20 @@ jobs:
           sed -i 's|applicationId = "com.botwrecomp.android"|applicationId = "com.botwrecomp.android.test"|' android/botwrecompandroid/app/build.gradle.kts
           grep -n applicationId android/botwrecompandroid/app/build.gradle.kts
 
+      - name: Restore the signing key (so new builds can update the old one)
+        id: signkey
+        uses: actions/cache@v4
+        with:
+          path: ~/.botwrecompandroid
+          key: signing-key-v1
+
+      - name: Create the signing key (only the first time)
+        if: steps.signkey.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.botwrecompandroid
+          keytool -genkeypair -keystore ~/.botwrecompandroid/test.jks -storepass botwtest123 -keypass botwtest123 -alias botwtest -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=BOTW test build"
+          printf 'storeFile=%s\nstorePassword=botwtest123\nkeyAlias=botwtest\nkeyPassword=botwtest123\n' "$HOME/.botwrecompandroid/test.jks" > ~/.botwrecompandroid/keystore.properties
+
       - name: Build the APK
         working-directory: android/botwrecompandroid
         run: |
@@ -136,4 +156,3 @@ jobs:
           name: botw-apk
           path: android/botwrecompandroid/app/build/outputs/apk/release/*.apk
           if-no-files-found: error
-          
