@@ -132,6 +132,57 @@ jobs:
           s = s.replace(old, 'trace = (e && atoi(e) != 0) || g_settings.vk_prof; }')
           open(p, 'w', encoding='utf-8').write(s)
           PY_EOF3
+          # the frame profiler also counts draws per fragment shader ([fshist] lines, every ~10 s)
+          cat > /tmp/fs_hist.c <<'HELPER_EOF'
+          #ifdef __ANDROID__
+          // The frame profiler: draws per fragment shader. Every 300 frames (about 10 s) the 12 shaders with the most draws are logged
+          // ([fshist]: shader hash, draws per frame), to see what a scene's thousands of draws are.
+          static void fs_hist_note(uint64_t h) {
+              static uint64_t hs[512];
+              static uint32_t cs[512], total;
+              static uint64_t start_frame;
+              uint64_t f = renderer_present_count();
+              if (!start_frame) start_frame = f;
+              if (f - start_frame >= 300) {
+                  double frames = (double)(f - start_frame);
+                  char line[1024];
+                  int n = snprintf(line, sizeof line, "[fshist] %.0f frames, %.0f draws a frame |", frames, total / frames);
+                  for (int k = 0; k < 12; k++) {
+                      int best = -1;
+                      for (int i = 0; i < 512; i++)
+                          if (cs[i] && (best < 0 || cs[i] > cs[best])) best = i;
+                      if (best < 0 || n > (int)sizeof line - 48) break;
+                      n += snprintf(line + n, sizeof line - n, " %016llx %.1f |", (unsigned long long)hs[best], cs[best] / frames);
+                      cs[best] = 0;
+                  }
+                  LOG("%s\n", line);
+                  memset(cs, 0, sizeof cs);
+                  total = 0;
+                  start_frame = f;
+              }
+              unsigned i = (unsigned)((h * 0x9E3779B97F4A7C15ull) >> 55);
+              for (unsigned k = 0; k < 512; k++, i = (i + 1) & 511) {
+                  if (cs[i] && hs[i] != h) continue;
+                  hs[i] = h;
+                  cs[i]++;
+                  break;
+              }
+              total++;
+          }
+          #endif
+          HELPER_EOF
+          python3 - <<'PY_EOF4'
+          p = 'runtime/nvn/vulkan/exec.c'
+          s = open(p, encoding='utf-8').read()
+          helper = open('/tmp/fs_hist.c', encoding='utf-8').read()
+          anchor = 'static uint64_t prof_tp_;\n'
+          assert s.count(anchor) == 1, 'prof_tp_ anchor not found exactly once'
+          s = s.replace(anchor, helper + anchor)
+          call = '        g_cur_fs_hash = last_hash;\n'
+          assert s.count(call) == 1, 'g_cur_fs_hash line not found exactly once'
+          s = s.replace(call, call + '#ifdef __ANDROID__\n        if (g_settings.vk_prof) fs_hist_note(last_hash);\n#endif\n')
+          open(p, 'w', encoding='utf-8').write(s)
+          PY_EOF4
           git diff --stat
 
       - name: Make this a separate app (so your installed one is not replaced)
@@ -165,4 +216,3 @@ jobs:
           name: botw-apk
           path: android/botwrecompandroid/app/build/outputs/apk/release/*.apk
           if-no-files-found: error
-          
