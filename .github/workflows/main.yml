@@ -66,17 +66,13 @@ jobs:
           +#endif
            #ifdef __ANDROID__
           diff --git a/runtime/settings.c b/runtime/settings.c
-          index 5cdcdbb..4a762d7 100644
+          index 5cdcdbb..e10d322 100644
           --- a/runtime/settings.c
           +++ b/runtime/settings.c
           @@ -276,2 +276,3 @@ void settings_load(void) {
                    else if (!strcmp(key, "log_file")) g_settings.log_file = atoi(val) != 0;
           +        else if (!strcmp(key, "vk_prof")) g_settings.vk_prof = atoi(val) != 0;
                    else if (!strcmp(key, "gpu_model")) snprintf(g_settings.gpu_model, sizeof g_settings.gpu_model, "%s", val);
-          @@ -384,2 +385,3 @@ void settings_save(void) {
-               fprintf(f, "driver_env = %s\nheap_file = %d\n", g_settings.driver_env, g_settings.heap_file);
-          +    fprintf(f, "vk_prof = %d\n", g_settings.vk_prof);
-           #undef TRI
           diff --git a/runtime/settings.h b/runtime/settings.h
           index 1094345..37fe46e 100644
           --- a/runtime/settings.h
@@ -100,6 +96,17 @@ jobs:
                    ImGui::PopTextWrapPos();
           PATCH_EOF
           git apply --verbose /tmp/prof-toggle.patch
+          # saving the setting: inserted after the show_fps line, wherever that is now
+          python3 - <<'PY_EOF'
+          p = 'runtime/settings.c'
+          s = open(p, encoding='utf-8').read()
+          old = 'fprintf(f, "show_fps = %d\\n", g_settings.show_fps);'
+          assert s.count(old) == 1, 'show_fps save line not found exactly once'
+          j = s.index('\n', s.index(old)) + 1
+          s = s[:j] + '#ifdef __ANDROID__\n    fprintf(f, "vk_prof = %d\\n", g_settings.vk_prof);\n#endif\n' + s[j:]
+          open(p, 'w', encoding='utf-8').write(s)
+          PY_EOF
+          git diff --stat
 
       - name: Make this a separate app (so your installed one is not replaced)
         run: |
@@ -118,3 +125,4 @@ jobs:
           name: botw-apk
           path: android/botwrecompandroid/app/build/outputs/apk/release/*.apk
           if-no-files-found: error
+          
