@@ -183,6 +183,37 @@ jobs:
           s = s.replace(call, call + '#ifdef __ANDROID__\n        if (g_settings.vk_prof) fs_hist_note(last_hash);\n#endif\n')
           open(p, 'w', encoding='utf-8').write(s)
           PY_EOF4
+          # an optional "Skip shadows" switch next to the profiler: depth-only passes (the shadow maps) are not drawn
+          python3 - <<'PY_EOF5'
+          def edit(path, old, new):
+              s = open(path, encoding='utf-8').read()
+              assert s.count(old) == 1, (path, old[:50])
+              open(path, 'w', encoding='utf-8').write(s.replace(old, new))
+          edit('runtime/settings.h',
+               '    bool vk_prof;',
+               '    bool skip_shadows;    // the shadow maps (depth-only passes) are not drawn: less work, a world without shadows\n    bool vk_prof;')
+          edit('runtime/settings.c',
+               '        else if (!strcmp(key, "vk_prof")) g_settings.vk_prof = atoi(val) != 0;\n',
+               '        else if (!strcmp(key, "vk_prof")) g_settings.vk_prof = atoi(val) != 0;\n'
+               '        else if (!strcmp(key, "skip_shadows")) g_settings.skip_shadows = atoi(val) != 0;\n')
+          edit('runtime/settings.c',
+               '    fprintf(f, "vk_prof = %d\\n", g_settings.vk_prof);\n',
+               '    fprintf(f, "vk_prof = %d\\n", g_settings.vk_prof);\n'
+               '    fprintf(f, "skip_shadows = %d\\n", g_settings.skip_shadows);\n')
+          edit('runtime/ui/launcher.mm',
+               'for bug reports only. Applies the next time the "\n                                  "game starts."));\n',
+               'for bug reports only. Applies the next time the "\n                                  "game starts."));\n'
+               '        ImGui::Spacing();\n'
+               '        if (ImGui::Checkbox(tr("Skip shadows (experimental)"), &g_settings.skip_shadows)) changed = true;\n'
+               '        ImGui::TextDisabled("%s", tr("Does not draw the shadow maps: less work for the CPU and the GPU, and a world without shadows. "\n'
+               '                                  "Applies at once."));\n')
+          edit('runtime/nvn/vulkan/exec.c',
+               '    if (prof) prof_tp_ = SDL_GetTicksNS();\n    if (!st.program) { stat_skipped++; return; }\n',
+               '    if (prof) prof_tp_ = SDL_GetTicksNS();\n    if (!st.program) { stat_skipped++; return; }\n'
+               '#ifdef __ANDROID__\n'
+               '    if (g_settings.skip_shadows && st.rt.depth && st.rt.ncolor == 0) { stat_skipped++; return; }  // (depth-only: the shadow maps)\n'
+               '#endif\n')
+          PY_EOF5
           git diff --stat
 
       - name: Make this a separate app (so your installed one is not replaced)
