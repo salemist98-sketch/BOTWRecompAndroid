@@ -354,6 +354,232 @@ jobs:
           PY_EOF5
           git diff --stat
 
+      - name: Apply extra performance toggles (pacing, workers, priority, caches, shader groups)
+        run: |
+          cat > /tmp/extra_toggles.py <<'PY_EXTRA'
+          # Extra performance toggles, applied after the "frame profiler" step. Run from the repository root.
+          import os, sys
+
+          def edit(path, old, new, count=1):
+              s = open(path, encoding='utf-8').read()
+              assert s.count(old) == count, (path, 'anchor found %d times' % s.count(old), old[:70])
+              open(path, 'w', encoding='utf-8').write(s.replace(old, new))
+
+          # ---- settings -----------------------------------------------------------------------------------------------------
+          edit('runtime/settings.h', '    bool vk_prof;',
+               '    int particles;        // Video > Performance > Particles: 0 Normal, 1 Low (half the draws), 2 Off (shader_groups.h)\n'
+               '    bool no_ambient;      // Disable ambient effects (shader_groups.h)\n'
+               '    unsigned skip_named;  // bit i: the i-th named shader toggle (shader_groups.h SG_NAMED) is on\n'
+               '    int vc_budget_mb;     // GPU geometry cache budget, MB (0: Automatic); read when the game starts (exec.c vc_budget)\n'
+               '    bool framepace_off;   // the game\'s own pacing and clock, not the runtime\'s (hle/framepace.c); read when the game starts\n'
+               '    int shader_workers;   // threads that compile shaders (0: Automatic, 1..4); read when the first one is needed\n'
+               '    int compile_prio;     // their priority: -1 low, 0 normal, 1 high\n'
+               '    bool vk_prof;')
+
+          edit('runtime/settings.c',
+               '        else if (!strcmp(key, "skip_fs")) snprintf(g_settings.skip_fs, sizeof g_settings.skip_fs, "%s", val);\n',
+               '        else if (!strcmp(key, "skip_fs")) snprintf(g_settings.skip_fs, sizeof g_settings.skip_fs, "%s", val);\n'
+               '        else if (!strcmp(key, "particles")) { int v = atoi(val); g_settings.particles = v < 0 ? 0 : v > 2 ? 2 : v; }\n'
+               '        else if (!strcmp(key, "no_ambient")) g_settings.no_ambient = atoi(val) != 0;\n'
+               '        else if (!strcmp(key, "skip_named")) g_settings.skip_named = (unsigned)strtoul(val, NULL, 10);\n'
+               '        else if (!strcmp(key, "vc_budget_mb")) { int v = atoi(val); g_settings.vc_budget_mb = v <= 0 ? 0 : v < 128 ? 128 : v > 2048 ? 2048 : v; }\n'
+               '        else if (!strcmp(key, "framepace_off")) g_settings.framepace_off = atoi(val) != 0;\n'
+               '        else if (!strcmp(key, "shader_workers")) { int v = atoi(val); g_settings.shader_workers = v < 0 ? 0 : v > 4 ? 4 : v; }\n'
+               '        else if (!strcmp(key, "compile_prio")) { int v = atoi(val); g_settings.compile_prio = v < 0 ? -1 : v > 0 ? 1 : 0; }\n')
+          edit('runtime/settings.c',
+               '    fprintf(f, "skip_fs = %s\\n", g_settings.skip_fs);\n',
+               '    fprintf(f, "skip_fs = %s\\n", g_settings.skip_fs);\n'
+               '    fprintf(f, "particles = %d\\nno_ambient = %d\\nskip_named = %u\\nvc_budget_mb = %d\\n", g_settings.particles,\n'
+               '            g_settings.no_ambient, g_settings.skip_named, g_settings.vc_budget_mb);\n'
+               '    fprintf(f, "framepace_off = %d\\nshader_workers = %d\\ncompile_prio = %d\\n", g_settings.framepace_off,\n'
+               '            g_settings.shader_workers, g_settings.compile_prio);\n')
+          edit('runtime/settings.c',
+               '    snprintf(g_settings.skip_fs, sizeof g_settings.skip_fs, "%s", d->skip_fs);\n',
+               '    snprintf(g_settings.skip_fs, sizeof g_settings.skip_fs, "%s", d->skip_fs);\n'
+               '    g_settings.particles = d->particles;\n'
+               '    g_settings.no_ambient = d->no_ambient;\n'
+               '    g_settings.skip_named = d->skip_named;\n'
+               '    g_settings.vc_budget_mb = d->vc_budget_mb;\n'
+               '    g_settings.framepace_off = d->framepace_off;\n'
+               '    g_settings.shader_workers = d->shader_workers;\n'
+               '    g_settings.compile_prio = d->compile_prio;\n')
+
+          # ---- frame pacing off: the game's own pacing and clock (LARECOMP_FRAMEPACE=0) -------------------------------------
+          edit('runtime/hle/framepace.c',
+               '    if (on < 0) on = g_game_version >= 182 && env_int("LARECOMP_FRAMEPACE", 1) != 0;\n',
+               '    if (on < 0) on = g_game_version >= 182 && env_int("LARECOMP_FRAMEPACE", 1) != 0;\n'
+               '#ifdef __ANDROID__\n'
+               '    if (on > 0 && g_settings.framepace_off) on = 0;  // (read once: restart the game)\n'
+               '#endif\n')
+
+          # ---- the known-shader lists ---------------------------------------------------------------------------------------
+          open('runtime/nvn/vulkan/shader_groups.h', 'w', encoding='utf-8').write('''\
+          // Known fragment shaders, by what they draw: hashes as the [fshist] lines print them (they belong to one game version).
+          // Test a hash in Video > Performance > Skip shaders first; when it removes only what the name says, add it here.
+          // A list with no hashes shows no row in the menu. Draws of these shaders are skipped, so never list one that builds
+          // a target the game keeps (terrain, the sky): those stay missing for good.
+          #pragma once
+          #include <stdint.h>
+
+          // Particles: Video > Performance > Particles (Normal / Low: half of the draws / Off). Each list ends with a 0.
+          static const uint64_t SG_PARTICLES[] = {0};
+          // Ambient effects: Video > Performance > Disable ambient effects
+          static const uint64_t SG_AMBIENT[] = {0};
+
+          // Named toggles, one row each under Skip shaders: label, what goes missing, up to 7 hashes (then a 0).
+          typedef struct { const char *label; const char *desc; uint64_t h[8]; } SgNamed;
+          static const SgNamed SG_NAMED[] = {
+              // {"Example effect", "What it removes.", {0x0123456789abcdefull}},
+              {NULL, NULL, {0}},
+          };
+          ''')
+
+          # ---- exec.c ---------------------------------------------------------------------------------------------------------
+          X = 'runtime/nvn/vulkan/exec.c'
+          edit(X, '        if (workers) n = atoi(workers);\n',
+               '        if (workers) n = atoi(workers);\n'
+               '#ifdef __ANDROID__\n'
+               '        else if (g_settings.shader_workers > 0) n = g_settings.shader_workers;  // (Video > Performance > CPU worker limit)\n'
+               '#endif\n')
+          PRIO = '''\
+          // Priority of the shader threads (Video > Performance > Shader compile priority): low 10, high -4 (the system may refuse
+          // a negative nice to an app: then they stay as they were)
+          #ifdef __ANDROID__
+          #include <sys/resource.h>
+          #include <sys/syscall.h>
+          #include <unistd.h>
+          static void compile_thread_prio(void) {
+              int p = g_settings.compile_prio;
+              if (!p) return;
+              if (setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), p < 0 ? 10 : -4) != 0 && p > 0) {
+                  static bool said;
+                  if (!said) { said = true; LOG("[vk] shader priority high: the system refused it\\n"); }
+              }
+          }
+          #else
+          static void compile_thread_prio(void) {}
+          #endif
+          '''
+          edit(X, 'static void *worker(void *a) {\n    (void)a;\n',
+               PRIO + 'static void *worker(void *a) {\n    (void)a;\n    compile_thread_prio();\n')
+          edit(X, 'static void *translator(void *a) {\n    (void)a;\n',
+               'static void *translator(void *a) {\n    (void)a;\n    compile_thread_prio();\n')
+          edit(X, '        if (e && atol(e) > 0) b = (uint64_t)atol(e) << 20;\n',
+               '        if (e && atol(e) > 0) b = (uint64_t)atol(e) << 20;\n'
+               '#ifdef __ANDROID__\n'
+               '        else if (g_settings.vc_budget_mb > 0) b = (uint64_t)g_settings.vc_budget_mb << 20;  // (Video > Performance)\n'
+               '#endif\n')
+          SG = '''\
+          #ifdef __ANDROID__
+          #include "shader_groups.h"
+          static int sg_len(const uint64_t *a) { int n = 0; while (a[n]) n++; return n; }
+          static bool sg_has(const uint64_t *a, uint64_t h) { for (; *a; a++) if (*a == h) return true; return false; }
+          static int sg_named_n(void) { int n = 0; while (SG_NAMED[n].label) n++; return n; }
+          // what the menu (ui/menu.mm) asks: which rows to show, and what they say
+          int vk_group_count(int g) { return g == 0 ? sg_len(SG_PARTICLES) : sg_len(SG_AMBIENT); }  // 0 particles, 1 ambient
+          int vk_named_count(void) { int n = 0; for (int i = 0; i < sg_named_n() && i < 32; i++) if (SG_NAMED[i].h[0]) n++; return n; }
+          static const SgNamed *sg_named_at(int k) {  // the k-th named toggle that has hashes
+              for (int i = 0; i < sg_named_n() && i < 32; i++) if (SG_NAMED[i].h[0] && k-- == 0) return &SG_NAMED[i];
+              return NULL;
+          }
+          const char *vk_named_label(int k) { const SgNamed *s = sg_named_at(k); return s ? s->label : ""; }
+          const char *vk_named_desc(int k) { const SgNamed *s = sg_named_at(k); return s ? s->desc : ""; }
+          // the draw of this fragment shader is not made (the menu's toggles, checked as the draw starts)
+          static bool sg_skip(uint64_t h) {
+              int level = g_settings.particles;
+              if (level && sg_has(SG_PARTICLES, h)) {
+                  static uint64_t frame = ~0ull;
+                  static unsigned tick;
+                  uint64_t f = renderer_present_count();
+                  if (f != frame) { frame = f; tick = 0; }  // (the same draws are kept each frame: no shimmer)
+                  if (level >= 2 || (tick++ & 1)) return true;
+              }
+              if (g_settings.no_ambient && sg_has(SG_AMBIENT, h)) return true;
+              if (g_settings.skip_named) {
+                  int k = 0;
+                  for (int i = 0; i < sg_named_n() && i < 32; i++) {
+                      if (!SG_NAMED[i].h[0]) continue;
+                      if (((g_settings.skip_named >> k) & 1) && sg_has(SG_NAMED[i].h, h)) return true;
+                      k++;
+                  }
+              }
+              return false;
+          }
+          #endif
+          '''
+          edit(X, 'static uint64_t prof_tp_;\n', SG + 'static uint64_t prof_tp_;\n')
+          edit(X, '        if (g_settings.skip_grass && draw_is_grass(pr)) { stat_skipped++; return; }\n',
+               '        if (g_settings.skip_grass && draw_is_grass(pr)) { stat_skipped++; return; }\n'
+               '        if (sg_skip(last_hash)) { stat_skipped++; return; }\n')
+
+          # ---- the menu: Video > Performance, under Skip shaders -------------------------------------------------------------
+          M = 'runtime/ui/menu.mm'
+          edit(M, 'extern "C" bool vk_low_ram_auto(long *total_mb); // (what Automatic picks on this device)\n',
+               'extern "C" bool vk_low_ram_auto(long *total_mb); // (what Automatic picks on this device)\n'
+               'extern "C" int vk_group_count(int group);        // runtime/nvn/vulkan/exec.c, shader_groups.h: 0 particles, 1 ambient\n'
+               'extern "C" int vk_named_count(void);             // (named shader toggles that have hashes)\n'
+               'extern "C" const char *vk_named_label(int k);\n'
+               'extern "C" const char *vk_named_desc(int k);\n')
+          UI = '''\
+              {   // Particles, ambient effects and named shader toggles: a row shows once its list has hashes (shader_groups.h)
+                  if (vk_group_count(0) > 0) {
+                      static const char *pn[] = {"Off", "Low", "Normal"};
+                      int pi = 2 - g_settings.particles;
+                      if (opt_choice("Particles", &pi, pn, 3, 2,
+                                     "Normal: as the game draws them. Low: half of the particle draws. Off: none. Applies at once.", false)) {
+                          g_settings.particles = 2 - pi;
+                          settings_save();
+                      }
+                  }
+                  if (vk_group_count(1) > 0 &&
+                      opt_toggle("Disable ambient effects", &g_settings.no_ambient, false,
+                                 "Does not draw the small effects floating in the air. Applies at once."))
+                      settings_save();
+                  for (int i = 0; i < vk_named_count() && i < 32; i++) {
+                      bool on = (g_settings.skip_named >> i) & 1u;
+                      if (opt_toggle(vk_named_label(i), &on, false, vk_named_desc(i))) {
+                          g_settings.skip_named = on ? (g_settings.skip_named | (1u << i)) : (g_settings.skip_named & ~(1u << i));
+                          settings_save();
+                      }
+                  }
+              }
+              {
+                  bool fp = !g_settings.framepace_off;
+                  if (opt_toggle("Frame pacing", &fp, true,
+                                 "On: the runtime paces the frames at the chosen frame rate and keeps the game's clock steady. Off: the game's own "
+                                 "pacing and clock (30 fps, 20 when slow); the frame rate setting stops applying. Restart the game."))
+                      { g_settings.framepace_off = !fp; settings_save(); }
+                  float sw = (float)g_settings.shader_workers;
+                  if (opt_slider("CPU worker limit", &sw, 0, 4, 1, 0, "%.0f",
+                                 "Threads that compile shaders (0: Automatic, up to 4). Fewer leaves CPU to the game, but a new area stays choppy "
+                                 "longer. The game's own job threads are not touched. Restart the game.")) {
+                      g_settings.shader_workers = (int)(sw + 0.5f);
+                      settings_save();
+                  }
+                  static const char *cp[] = {"Low", "Normal", "High"};
+                  int ci = g_settings.compile_prio + 1;
+                  if (opt_choice("Shader compile priority", &ci, cp, 3, 1,
+                                 "Low: the compile threads yield to the game. High: they ask the system for more CPU time (it may refuse). "
+                                 "Restart the game.", false)) {
+                      g_settings.compile_prio = ci - 1;
+                      settings_save();
+                  }
+                  float vb = (float)g_settings.vc_budget_mb;
+                  if (opt_slider("Geometry cache budget", &vb, 0, 1536, 64, 0, "%.0f MB",
+                                 "GPU memory for the game's vertex and index data (0: Automatic, 768 MB, less on 4 GB phones). Lower saves "
+                                 "memory but copies more. Not textures: their size is Texture quality. Restart the game.")) {
+                      g_settings.vc_budget_mb = (int)(vb + 0.5f);
+                      settings_save();
+                  }
+              }
+          '''
+          edit(M, '"A wrong one can hide things: clear the box to undo. Applies within a second.")) settings_save();\n',
+               '"A wrong one can hide things: clear the box to undo. Applies within a second.")) settings_save();\n' + UI)
+          print('extra toggles applied')
+          PY_EXTRA
+          python3 /tmp/extra_toggles.py
+          git diff --stat
+
       - name: Make this a separate app (so your installed one is not replaced)
         run: |
           sed -i 's|applicationId = "com.botwrecomp.android"|applicationId = "com.botwrecomp.android.test"|' android/botwrecompandroid/app/build.gradle.kts
