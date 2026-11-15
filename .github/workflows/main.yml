@@ -123,6 +123,15 @@ jobs:
           s = s[:i] + ins + s[i:]
           open(p, 'w', encoding='utf-8').write(s)
           PY_EOF2
+          # the frame profiler also turns on the pace trace: every 2 s, the game thread's and the render thread's busy ms per frame
+          python3 - <<'PY_EOF3'
+          p = 'runtime/nvn/vulkan/exec.c'
+          s = open(p, encoding='utf-8').read()
+          old = 'trace = e && atoi(e) != 0; }'
+          assert s.count(old) == 1, 'pace trace line not found exactly once'
+          s = s.replace(old, 'trace = (e && atoi(e) != 0) || g_settings.vk_prof; }')
+          open(p, 'w', encoding='utf-8').write(s)
+          PY_EOF3
           git diff --stat
 
       - name: Make this a separate app (so your installed one is not replaced)
@@ -156,3 +165,4 @@ jobs:
           name: botw-apk
           path: android/botwrecompandroid/app/build/outputs/apk/release/*.apk
           if-no-files-found: error
+          
