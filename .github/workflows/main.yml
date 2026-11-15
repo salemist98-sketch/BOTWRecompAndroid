@@ -331,4 +331,18 @@ jobs:
         if: steps.signkey.outputs.cache-hit != 'true'
         run: |
           mkdir -p ~/.botwrecompandroid
-          keytool -genkeypair -keystore ~/.botwrecompandroid/tes
+          keytool -genkeypair -keystore ~/.botwrecompandroid/test.jks -storepass botwtest123 -keypass botwtest123 -alias botwtest -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=BOTW test build"
+          printf 'storeFile=%s\nstorePassword=botwtest123\nkeyAlias=botwtest\nkeyPassword=botwtest123\n' "$HOME/.botwrecompandroid/test.jks" > ~/.botwrecompandroid/keystore.properties
+
+      - name: Build the APK
+        working-directory: android/botwrecompandroid
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleRelease
+
+      - name: Upload the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: botw-apk
+          path: android/botwrecompandroid/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
