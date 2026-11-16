@@ -791,7 +791,7 @@ jobs:
           // first far plane seen stays the original, so Normal puts it back at the next rebuild.
           static void persp_far_limit(uint64_t proj) {
               static const float share[4] = {1.0f, 0.75f, 0.5f, 0.3f};
-              static struct { uint64_t proj; float orig; } seen[16];
+              static struct { uint64_t proj; float orig, last; } seen[16];
               static int nseen;
               int lv = g_settings.render_dist;
               if (lv < 0 || lv > 3) lv = 0;
@@ -801,7 +801,10 @@ jobs:
               if (k < 0) {
                   if (!lv || nseen == 16) return;
                   if (!(p[0] > 0.0f && p[0] <= 5.0f && p[1] >= 10000.0f && p[1] <= 200000.0f)) return;
-                  seen[nseen].proj = proj, seen[nseen].orig = p[1], k = nseen++;
+                  seen[nseen].proj = proj, seen[nseen].orig = seen[nseen].last = p[1], k = nseen++;
+              } else if (p[1] != seen[k].last) {  // the game set a far plane of its own (or the address is another object's now)
+                  if (!(p[0] > 0.0f && p[0] <= 5.0f && p[1] >= 10000.0f && p[1] <= 200000.0f)) { seen[k].proj = 0; return; }
+                  seen[k].orig = p[1];
               }
               float f = lv ? seen[k].orig * share[lv] : seen[k].orig;
               if (f < 3000.0f) f = 3000.0f;
@@ -809,6 +812,7 @@ jobs:
                   p[1] = f;
                   LOG("[widescreen] render distance %d: far plane %.0f\n", lv, f);
               }
+              seen[k].last = f;
           }
           #endif
           void rt_persp_update(uint64_t proj) {
@@ -963,6 +967,176 @@ jobs:
           print('round 2 applied')
           PY_ROUND2
           python3 /tmp/round2.py
+          git diff --stat
+
+      - name: Apply extra options (texture sharpness, effect-skip and render-target logs, lower resolution when hot)
+        run: |
+          cat > /tmp/round3.py <<'PY_ROUND3'
+          # Round 3, after the requested-options step. Run from the repository root.
+          #   Texture sharpness   a positive mip bias on mipmapped samplers
+          #   Effect-skip log     with the Frame profiler on, the draws the particle / environmental detection skips are listed
+          #   Lower resolution when hot   the 3D image steps down at once when Android reports heat; the 30 fps cap waits 45 s
+          def edit(path, old, new, count=1):
+              s = open(path, encoding='utf-8').read()
+              assert s.count(old) == count, (path, 'anchor found %d times' % s.count(old), old[:80])
+              open(path, 'w', encoding='utf-8').write(s.replace(old, new))
+
+          # ---- settings ---------------------------------------------------------------------------------------------------------
+          edit('runtime/settings.h', '    bool vk_prof;',
+               r'''    int mip_bias;         // Texture sharpness: 0 Normal, 1..3 a mip bias of +0.5 / +1 / +1.5 on mipmapped samplers (textures.c); read as samplers are made
+              bool thermal_res;     // the 3D image 25% smaller while Android says the phone is hot; the 30 fps cap then waits 45 s (output_scale.c, framepace.c)
+              bool vk_prof;''')
+          edit('runtime/settings.c',
+               '        else if (!strcmp(key, "vk_prof")) g_settings.vk_prof = atoi(val) != 0;\n',
+               '        else if (!strcmp(key, "vk_prof")) g_settings.vk_prof = atoi(val) != 0;\n' + r'''        else if (!strcmp(key, "mip_bias")) { int v = atoi(val); g_settings.mip_bias = v < 0 ? 0 : v > 3 ? 3 : v; }
+                  else if (!strcmp(key, "thermal_res")) g_settings.thermal_res = atoi(val) != 0;
+          ''')
+          edit('runtime/settings.c',
+               '            g_settings.dyn_min, g_settings.dyn_target);\n',
+               '            g_settings.dyn_min, g_settings.dyn_target);\n' + r'''    fprintf(f, "mip_bias = %d\nthermal_res = %d\n", g_settings.mip_bias, g_settings.thermal_res);
+          ''')
+          edit('runtime/settings.c',
+               '    g_settings.dyn_target = d->dyn_target;\n',
+               '    g_settings.dyn_target = d->dyn_target;\n    g_settings.mip_bias = d->mip_bias;\n    g_settings.thermal_res = d->thermal_res;\n')
+
+          # ---- texture sharpness ------------------------------------------------------------------------------------------------
+          edit('runtime/nvn/vulkan/textures.c',
+               '        else if (cap > 1 && si.anisotropyEnable && si.maxAnisotropy > (float)cap) si.maxAnisotropy = (float)cap;\n    }\n',
+               '        else if (cap > 1 && si.anisotropyEnable && si.maxAnisotropy > (float)cap) si.maxAnisotropy = (float)cap;\n    }\n' + r'''#ifdef __ANDROID__
+              if (g_settings.mip_bias > 0 && mf > 1) {  // Video > Performance > Texture sharpness: mipmapped samplers read a smaller level sooner
+                  si.mipLodBias += 0.5f * (float)g_settings.mip_bias;  // (samplers are made once: the next start)
+                  if (si.mipLodBias > g_vk.props.limits.maxSamplerLodBias) si.mipLodBias = g_vk.props.limits.maxSamplerLodBias;
+              }
+          #endif
+          ''')
+
+          # ---- the effect-skip log ----------------------------------------------------------------------------------------------
+          X = 'runtime/nvn/vulkan/exec.c'
+          edit(X, 'static uint64_t prof_tp_;\n',
+               r'''#ifdef __ANDROID__
+          // Frame profiler: the fragment shaders whose draws the particle / environmental detection skipped, as [fxskip] lines - the
+          // first time each is seen, and a count for each every ~10 s. Hashes as in [fshist]: a good one goes in shader_groups.h.
+          static void fx_log(uint64_t h, uint32_t ninst) {
+              static struct { uint64_t h; uint32_t n, inst; } tab[64];
+              static int ntab;
+              static uint64_t start_frame;
+              uint64_t f = renderer_present_count();
+              if (!start_frame) start_frame = f;
+              int k = -1;
+              for (int i = 0; i < ntab; i++) if (tab[i].h == h) { k = i; break; }
+              if (k < 0 && ntab < 64) {
+                  k = ntab++;
+                  tab[k].h = h, tab[k].inst = ninst;
+                  const uint8_t *b = st.blend[0];
+                  LOG("[fxskip] new: fs %016llx instances %u blend %u/%u eq %u depth write %u\n", (unsigned long long)h, ninst, b[1], b[2], b[5], st.ds[1]);
+              }
+              if (k >= 0) tab[k].n++;
+              if (f - start_frame >= 600) {
+                  double frames = (double)(f - start_frame);
+                  for (int i = 0; i < ntab; i++) {
+                      if (tab[i].n) LOG("[fxskip] fs %016llx: %.1f draws a frame skipped\n", (unsigned long long)tab[i].h, tab[i].n / frames);
+                      tab[i].n = 0;
+                  }
+                  start_frame = f;
+              }
+          }
+          #endif
+          static uint64_t prof_tp_;
+          ''')
+          edit(X, '        if (fx_heuristic(indexed ? (uint32_t)r->x[6] : (uint32_t)r->x[4])) { stat_skipped++; return; }\n',
+               '        {\n'
+               '            uint32_t fxn = indexed ? (uint32_t)r->x[6] : (uint32_t)r->x[4];\n'
+               '            if (fx_heuristic(fxn)) {\n'
+               '                if (g_settings.vk_prof) fx_log(last_hash, fxn);\n'
+               '                stat_skipped++;\n'
+               '                return;\n'
+               '            }\n'
+               '        }\n')
+
+          # ---- lower resolution when hot ----------------------------------------------------------------------------------------
+          F = 'runtime/hle/framepace.c'
+          edit(F, 'static volatile int g_thermal_hot;  // (1: capped now)\n',
+               r'''static volatile int g_thermal_hot;  // (1: capped now)
+          static volatile uint64_t g_hot_since;  // (when it began, plat_now_ns)
+          // Video > Performance > Lower resolution when hot: the image gets smaller at once (output_scale.c), so the 30 fps cap
+          // waits for the heat to last 45 s
+          static bool thermal_fps_capped(void) {
+              if (!g_thermal_hot) return false;
+          #ifdef __ANDROID__
+              if (g_settings.thermal_res && plat_now_ns() - g_hot_since < 45000000000ull) return false;
+          #endif
+              return true;
+          }
+          bool framepace_thermal_hot(void) { return g_thermal_hot != 0; }  // (output_scale.c)
+          ''')
+          edit(F, '            g_thermal_hot = 1;\n', '            g_thermal_hot = 1, g_hot_since = now;\n')
+          edit(F, '    if (g_thermal_hot && (m == 2 || m == 4) && thermal_cap_on()) return 1;\n',
+               '    if (thermal_fps_capped() && (m == 2 || m == 4) && thermal_cap_on()) return 1;\n')
+          edit(F, 'bool framepace_thermal_capped(void) { return g_thermal_hot && thermal_cap_on()',
+               'bool framepace_thermal_capped(void) { return thermal_fps_capped() && thermal_cap_on()')
+          edit('runtime/nvn/output_scale.c', '    hs = fmax(hs, 0.1);\n',
+               r'''#ifdef __ANDROID__
+              {   // Video > Performance > Lower resolution when hot: a quarter off the 3D image's size while Android says the phone is hot
+                  extern bool framepace_thermal_hot(void);
+                  if (g_settings.thermal_res && forced <= 0 && framepace_thermal_hot()) hs *= 0.75;
+              }
+          #endif
+              hs = fmax(hs, 0.1);
+          ''')
+
+          # ---- the menu ---------------------------------------------------------------------------------------------------------
+          M = 'runtime/ui/menu.mm'
+          edit(M, '    opt_section("Performance experiments");\n',
+               r'''    {
+                  bool tr_ = g_settings.thermal_res;
+                  if (opt_toggle("Lower resolution when hot", &tr_, false,
+                                 "While Android says the phone is too hot, the 3D image is a quarter smaller at once, and the 30 fps cap (above) waits "
+                                 "until the heat has lasted 45 seconds - often the smaller image is enough to keep the frame rate. Back at full "
+                                 "size once it has cooled for 30 seconds. Works at any frame rate. Applies at once.")) {
+                      g_settings.thermal_res = tr_;
+                      settings_save();
+                  }
+              }
+              opt_section("Performance experiments");
+          ''')
+          edit(M, '        extern int g_game_version;\n        static const char *rd[] = {"Normal", "75%", "50%", "30%"};\n',
+               r'''        static const char *mb[] = {"Normal", "Softer", "Soft", "Softest"};
+                  if (opt_choice("Texture sharpness", &g_settings.mip_bias, mb, 4, 0,
+                                 "Textures switch to a smaller version sooner as they get farther or slanted: less memory read by the GPU, softer "
+                                 "ground and walls at a distance. Softer +0.5, Soft +1, Softest +1.5 levels. Applies the next time the game starts.", false))
+                      settings_save();
+                  extern int g_game_version;
+                  static const char *rd[] = {"Normal", "75%", "50%", "30%"};
+          ''')
+
+          # ---- render target list (for finding water / reflection targets) ------------------------------------------------------
+          T = 'runtime/nvn/vulkan/textures.c'
+          edit(T, 'static uint8_t tex_scale_group(const NvnTexture *t) {\n',
+               r'''#ifdef __ANDROID__
+          // Frame profiler: each size of render target that is not screen-sized, once, as [rtlist] lines - water, reflection and
+          // other effect targets are among them. Which is which is for a look at the frame (a capture) and a try.
+          static void tex_rt_log(const NvnTexture *t) {
+              static struct { uint32_t w, h, tgt, fmt, fl; } seen[128];
+              static int n;
+              for (int i = 0; i < n; i++)
+                  if (seen[i].w == t->width && seen[i].h == t->height && seen[i].tgt == t->target && seen[i].fmt == t->format && seen[i].fl == t->flags) return;
+              if (n == 128) return;
+              seen[n].w = t->width, seen[n].h = t->height, seen[n].tgt = t->target, seen[n].fmt = t->format, seen[n].fl = t->flags, n++;
+              LOG("[rtlist] %ux%u target %u format %#x flags %#x levels %u\n", t->width, t->height, (unsigned)t->target, (unsigned)t->format,
+                  (unsigned)t->flags, (unsigned)t->layout.levels);
+          }
+          #endif
+          static uint8_t tex_scale_group(const NvnTexture *t) {
+          ''')
+          edit(T, '    b->rs_group = tex_scale_group(t);\n    create_image(t, b);\n    t->backend = b;\n',
+               '    b->rs_group = tex_scale_group(t);\n'
+               '#ifdef __ANDROID__\n'
+               '    if (g_settings.vk_prof && b->rs_group == RS_NONE && (t->flags & 8) && t->samples <= 1 && t->width >= 32 && t->height >= 16) tex_rt_log(t);\n'
+               '#endif\n'
+               '    create_image(t, b);\n    t->backend = b;\n')
+          print('round 3 applied')
+          PY_ROUND3
+          python3 /tmp/round3.py
           git diff --stat
 
       - name: Make this a separate app (so your installed one is not replaced)
