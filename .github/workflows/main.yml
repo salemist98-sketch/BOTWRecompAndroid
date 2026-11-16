@@ -1706,6 +1706,109 @@ jobs:
           python3 /tmp/round7.py
           git diff --stat
 
+      - name: Apply grass fixes (keep grass options off the terrain, thin by triangles, grass stats)
+        run: |
+          cat > /tmp/round8.py <<'PY_ROUND8'
+          # Round 8, after round 7. Run from the repository root.
+          #   The log shows every "grass" vertex shader (one that reads an RGBA16 texture) draws indexed with ONE instance, and the
+          #   sizes run from 3 to 5874 indices: the big ones are terrain patches (with Skip grass on, the ground went black).
+          #   - every grass option now takes only draws of at most grass_max_count() indices (1000; "grass_max" in the ini changes it),
+          #     Skip grass included: terrain stays
+          #   - Grass density thins by indices instead (a triangle list: the last triangles of each grass draw go)
+          #   - Frame profiler: [clsstat] lines, every ~10 s: per vertex shader of those classes, draws a frame, the smallest and the
+          #     largest index count, the most instances - for tuning the limit
+          def edit(path, old, new, count=1):
+              s = open(path, encoding='utf-8').read()
+              assert s.count(old) == count, (path, 'anchor found %d times' % s.count(old), old[:80])
+              open(path, 'w', encoding='utf-8').write(s.replace(old, new))
+
+          edit('runtime/settings.h', '    bool vk_prof;',
+               '    int grass_max;        // the most indices a draw can have and still be "grass" for Skip grass, Grass density and Grass distance (0: 1000)\n    bool vk_prof;')
+          edit('runtime/settings.c', '        else if (!strcmp(key, "grass_density"))',
+               '        else if (!strcmp(key, "grass_max")) { int v = atoi(val); g_settings.grass_max = v < 50 ? 0 : v > 100000 ? 100000 : v; }\n'
+               '        else if (!strcmp(key, "grass_density"))')
+          edit('runtime/settings.c', '    fprintf(f, "grass_density = %d\\ngrass_dist = %d\\nchar_dist = %d\\n", g_settings.grass_density, g_settings.grass_dist, g_settings.char_dist);\n',
+               '    fprintf(f, "grass_density = %d\\ngrass_dist = %d\\nchar_dist = %d\\ngrass_max = %d\\n", g_settings.grass_density, g_settings.grass_dist, g_settings.char_dist,\n            g_settings.grass_max);\n')
+          edit('runtime/settings.c', '    g_settings.grass_dist = d->grass_dist;\n', '    g_settings.grass_dist = d->grass_dist;\n    g_settings.grass_max = d->grass_max;\n')
+
+          X = 'runtime/nvn/vulkan/exec.c'
+          # the limit, the index-count thinning, the stats - before the instance thinning
+          edit(X, 'static uint32_t grass_thin_inst(Prog *pr, uint32_t n, uint32_t count, bool indexed) {\n    int lv = g_settings.grass_density;\n',
+               r'''// The most indices a draw can have and still be grass (the terrain patches that read the same kind of texture have thousands)
+          static uint32_t grass_max_count(void) { return g_settings.grass_max >= 50 ? (uint32_t)g_settings.grass_max : 1000u; }
+          // Video > Performance > Grass density: a triangle-list grass draw (small, as above) keeps 75%, 50% or 25% of its triangles -
+          // the last ones go, at least one stays
+          static uint32_t grass_thin_count(Prog *pr, uint32_t mode, uint32_t count) {
+              int lv = g_settings.grass_density;
+              if (lv <= 0 || mode != 4 || count < 6 || count % 3 || count > grass_max_count() || !draw_is_grass(pr)) return count;
+              uint32_t k = count / 3 * (uint32_t)(lv == 1 ? 75 : lv == 2 ? 50 : 25) / 100 * 3;
+              return k < 3 ? 3 : k;
+          }
+          // Frame profiler: per vertex shader of the grass / texture-reading and skinned classes, every ~600 frames
+          static void cls_stat(uint64_t vs, const char *kind, uint32_t count, uint32_t ninst) {
+              static struct { uint64_t vs; uint32_t draws, cmin, cmax, imax; const char *kind; } t[96];
+              static int nt;
+              static uint64_t start;
+              uint64_t f = renderer_present_count();
+              if (!start) start = f;
+              int k = -1;
+              for (int i = 0; i < nt; i++) if (t[i].vs == vs) { k = i; break; }
+              if (k < 0 && nt < 96) { k = nt++; t[k].vs = vs; t[k].cmin = ~0u; t[k].kind = kind; }
+              if (k >= 0) {
+                  t[k].draws++;
+                  if (count < t[k].cmin) t[k].cmin = count;
+                  if (count > t[k].cmax) t[k].cmax = count;
+                  if (ninst > t[k].imax) t[k].imax = ninst;
+              }
+              if (f - start >= 600) {
+                  double fr = (double)(f - start);
+                  for (int i = 0; i < nt; i++) {
+                      if (t[i].draws)
+                          LOG("[clsstat] %s vs %llx: %.1f draws a frame, %u to %u indices, up to %u instances\n", t[i].kind, (unsigned long long)t[i].vs,
+                              t[i].draws / fr, t[i].cmin, t[i].cmax, t[i].imax);
+                      t[i].draws = 0, t[i].cmin = ~0u, t[i].cmax = 0, t[i].imax = 0;
+                  }
+                  start = f;
+              }
+          }
+          static uint32_t grass_thin_inst(Prog *pr, uint32_t n, uint32_t count, bool indexed) {
+              int lv = g_settings.grass_density;
+          ''')
+          edit(X, '    if (lv <= 0 || n < 2) return n;\n    uint32_t k = n * (uint32_t)(lv == 1 ? 75 : lv == 2 ? 50 : 25) / 100;\n',
+               '    if (lv <= 0 || n < 2 || count > grass_max_count()) return n;\n    uint32_t k = n * (uint32_t)(lv == 1 ? 75 : lv == 2 ? 50 : 25) / 100;\n')
+          # the cull
+          edit(X, 'static int draw_cull_depth(Prog *pr, const ShaderKey *vkey) {\n',
+               'static int draw_cull_depth(Prog *pr, const ShaderKey *vkey, uint32_t count, uint32_t ninst) {\n')
+          edit(X, '    bool grass = draw_is_grass(pr);\n    bool skinned = false;\n',
+               '    bool rgba = draw_is_grass(pr);\n    bool grass = rgba && count <= grass_max_count();\n    bool skinned = false;\n')
+          edit(X, '    if (prof && (grass || skinned)) {\n        static uint64_t seen[96];\n',
+               '    if (prof && (rgba || skinned)) cls_stat(st.program->stages[0].code_addr, grass ? "grass" : rgba ? "texture-reading (big)" : "skinned", count, ninst);\n'
+               '    if (prof && (grass || skinned)) {\n        static uint64_t seen[96];\n')
+          edit(X, '        int cdv = draw_cull_depth(pr, &vkey);\n',
+               '        int cdv = draw_cull_depth(pr, &vkey, (uint32_t)r->x[2], indexed ? (uint32_t)r->x[6] : (uint32_t)r->x[4]);\n')
+          edit(X, 'static uint32_t grass_thin_inst(Prog *pr, uint32_t n, uint32_t count, bool indexed) { (void)pr; (void)count; (void)indexed; return n; }\n',
+               'static uint32_t grass_thin_inst(Prog *pr, uint32_t n, uint32_t count, bool indexed) { (void)pr; (void)count; (void)indexed; return n; }\n'
+               'static uint32_t grass_thin_count(Prog *pr, uint32_t mode, uint32_t count) { (void)pr; (void)mode; return count; }\n')
+          # Skip grass: small draws only
+          edit(X, '        if (g_settings.skip_grass && draw_is_grass(pr)) { stat_skipped++; return; }\n',
+               '        if (g_settings.skip_grass && (uint32_t)r->x[2] <= grass_max_count() && draw_is_grass(pr)) { stat_skipped++; return; }\n')
+          # Grass density: the index count
+          edit(X, '    uint32_t first = 0, count = (uint32_t)r->x[2], inst, base_inst, max_index = 0;\n',
+               '    uint32_t first = 0, count = grass_thin_count(pr, mode, (uint32_t)r->x[2]), inst, base_inst, max_index = 0;\n')
+          M = 'runtime/ui/menu.mm'
+          edit(M, '"How much of the grass is drawn: an instanced grass draw draws 75%, 50% or 25% of its instances (it is found as Skip "\n'
+                  '                       "grass finds it). The last instances go, so a whole patch can thin out or go bare instead of every blade thinning. "\n'
+                  '                       "Not a distance: the game decides what is drawn. With the Frame profiler on, the log shows how the grass is drawn "\n'
+                  '                       "([grassdraw] lines). Applies at once."',
+               '"How much of the grass is drawn: each small grass draw keeps 75%, 50% or 25% of its triangles - the last ones go, so a "\n'
+               '                       "tuft thins out. Terrain is left alone (only draws of up to 1000 indices count as grass: grass_max in the ini "\n'
+               '                       "changes that). Not a distance: the game decides what is drawn. With the Frame profiler on, [clsstat] lines in "\n'
+               '                       "the log show each grass shader. Applies at once."')
+          print('round 8 applied')
+          PY_ROUND8
+          python3 /tmp/round8.py
+          git diff --stat
+
       - name: Make this a separate app (so your installed one is not replaced)
         run: |
           sed -i 's|applicationId = "com.botwrecomp.android"|applicationId = "com.botwrecomp.android.test"|' android/botwrecompandroid/app/build.gradle.kts
