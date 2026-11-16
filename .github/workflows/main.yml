@@ -1809,6 +1809,213 @@ jobs:
           python3 /tmp/round8.py
           git diff --stat
 
+      - name: Apply distance sliders, export/import settings and a shorter log
+        run: |
+          cat > /tmp/round4.py <<'PY_ROUND4'
+          # Round 4, after the grass fixes step. Run from the repository root.
+          #   Distance sliders   Grass / Character / Object distance in metres (the old steps stay; a slider above 0 wins over them)
+          #   Export / Import    the settings as text through the clipboard, without what belongs to this phone
+          #   Shorter log        [gpuprof] leaves out rows under 0.1 ms; [hitch] at most 5 lines in 10 s, then a count
+          def edit(path, old, new, count=1):
+              s = open(path, encoding='utf-8').read()
+              assert s.count(old) == count, (path, 'anchor found %d times' % s.count(old), old[:80])
+              open(path, 'w', encoding='utf-8').write(s.replace(old, new))
+
+          # ---- settings -----------------------------------------------------------------------------------------------------
+          edit('runtime/settings.h', '    bool vk_prof;',
+               '    int grass_dist_m;     // Grass distance in metres (30..300, steps of 10; 0: use the steps) - exec.c draw_cull_depth\n'
+               '    int char_dist_m;      // Character distance in metres (the same)\n'
+               '    int prop_dist_m;      // Object distance in metres: instanced draws that are not grass, characters or terrain (0: off)\n'
+               '    bool vk_prof;')
+          edit('runtime/settings.h', 'void settings_save(void);\n',
+               'void settings_save(void);\n'
+               'bool settings_export_clipboard(void);  // the settings as text onto the clipboard (Android)\n'
+               'int settings_import_clipboard(void);   // settings text from the clipboard: how many it applied, -1 for none\n')
+          edit('runtime/settings.c',
+               '        else if (!strcmp(key, "char_dist")) { int v = atoi(val); g_settings.char_dist = v < 0 ? 0 : v > 4 ? 4 : v; }\n',
+               '        else if (!strcmp(key, "char_dist")) { int v = atoi(val); g_settings.char_dist = v < 0 ? 0 : v > 4 ? 4 : v; }\n'
+               '        else if (!strcmp(key, "grass_dist_m")) { int v = atoi(val); g_settings.grass_dist_m = v < 30 ? 0 : v > 300 ? 300 : (v + 5) / 10 * 10; }\n'
+               '        else if (!strcmp(key, "char_dist_m")) { int v = atoi(val); g_settings.char_dist_m = v < 30 ? 0 : v > 300 ? 300 : (v + 5) / 10 * 10; }\n'
+               '        else if (!strcmp(key, "prop_dist_m")) { int v = atoi(val); g_settings.prop_dist_m = v < 30 ? 0 : v > 300 ? 300 : (v + 5) / 10 * 10; }\n')
+          edit('runtime/settings.c', '            g_settings.grass_max);\n',
+               '            g_settings.grass_max);\n'
+               '    fprintf(f, "grass_dist_m = %d\\nchar_dist_m = %d\\nprop_dist_m = %d\\n", g_settings.grass_dist_m, g_settings.char_dist_m,\n'
+               '            g_settings.prop_dist_m);\n')
+          edit('runtime/settings.c', '    g_settings.char_dist = d->char_dist;\n',
+               '    g_settings.char_dist = d->char_dist;\n'
+               '    g_settings.grass_dist_m = d->grass_dist_m;\n'
+               '    g_settings.char_dist_m = d->char_dist_m;\n'
+               '    g_settings.prop_dist_m = d->prop_dist_m;\n')
+
+          # ---- export / import: the loader's body becomes settings_read(FILE *), so a copy of the text can go through it ------------
+          edit('runtime/settings.c',
+               'void settings_load(void) {\n'
+               '    static bool loaded;\n'
+               '    if (!g_have_defaults) g_defaults = g_settings, g_have_defaults = true;\n'
+               '    if (loaded) return;\n'
+               '    loaded = true;\n'
+               '    FILE *f = fopen(SETTINGS_FILE, "r");\n'
+               '    if (!f) return;\n',
+               'static void settings_read(FILE *f);\n'
+               'void settings_load(void) {\n'
+               '    static bool loaded;\n'
+               '    if (!g_have_defaults) g_defaults = g_settings, g_have_defaults = true;\n'
+               '    if (loaded) return;\n'
+               '    loaded = true;\n'
+               '    FILE *f = fopen(SETTINGS_FILE, "r");\n'
+               '    if (!f) return;\n'
+               '    settings_read(f);\n'
+               '}\n'
+               '\n'
+               '// (the file\'s lines, one by one; Import settings reads a copy of the pasted text the same way)\n'
+               'static void settings_read(FILE *f) {\n')
+          EXPORT = '''\
+          #ifdef __ANDROID__
+          // Export settings / Import settings: the settings file as text, through the clipboard. What belongs to this phone (its GPU
+          // and driver options, the game files, mods, the language) is left out going out and ignored coming in, as Reset all
+          // settings keeps it.
+          static bool settings_key_is_phone(const char *key) {
+              static const char *const phone[] = {"gpu_model", "driver_env", "heap_file", "gpu_heap", "inplace_reads", "turnip_lrz",
+                                                  "files_in_place", "native_code", "shader_int32", "sync_lag", "low_ram", "log_file",
+                                                  "mods_off", "language", "menu_tip_seen", "aspect_asked", NULL};
+              for (int i = 0; phone[i]; i++) if (!strcmp(key, phone[i])) return true;
+              return false;
+          }
+          // the lines of `in` that are "key = value" and not the phone's, into out (cap bytes); how many lines
+          static int settings_filter_text(const char *in, char *out, size_t cap) {
+              size_t n = 0;
+              int lines = 0;
+              if (cap) out[0] = 0;
+              for (const char *p = in; *p;) {
+                  const char *e = strchr(p, '\\n');
+                  size_t len = e ? (size_t)(e - p) : strlen(p);
+                  char key[64];
+                  if (len > 0 && len < 640 && sscanf(p, " %63[^= \\r\\n] =", key) == 1 && key[0] != '#' && !settings_key_is_phone(key) &&
+                      memchr(p, '=', len) && n + len + 2 < cap) {
+                      memcpy(out + n, p, len);
+                      n += len;
+                      if (n && out[n - 1] == '\\r') n--;
+                      out[n++] = '\\n';
+                      out[n] = 0;
+                      lines++;
+                  }
+                  p += len + (e ? 1 : 0);
+              }
+              return lines;
+          }
+          bool settings_export_clipboard(void) {
+              settings_save();  // (the file is what the menu shows)
+              FILE *f = fopen(SETTINGS_FILE, "r");
+              if (!f) return false;
+              static char raw[24576], out[24576];
+              size_t n = fread(raw, 1, sizeof raw - 1, f);
+              fclose(f);
+              raw[n] = 0;
+              int lines = settings_filter_text(raw, out, sizeof out);
+              if (lines <= 0) return false;
+              static const char head[] = "# BOTWRecompAndroid settings export\\n";
+              static char text[sizeof out + sizeof head];
+              snprintf(text, sizeof text, "%s%s", head, out);
+              bool ok = SDL_SetClipboardText(text);
+              LOG("[settings] exported %d settings to the clipboard\\n", lines);
+              return ok;
+          }
+          int settings_import_clipboard(void) {
+              char *clip = SDL_GetClipboardText();
+              if (!clip) return -1;
+              static char out[24576];
+              int lines = settings_filter_text(clip, out, sizeof out);
+              SDL_free(clip);
+              if (lines <= 0) return -1;
+              FILE *f = fmemopen(out, strlen(out), "r");
+              if (!f) return -1;
+              settings_read(f);  // (closes f)
+              settings_save();
+              LOG("[settings] imported %d settings from the clipboard\\n", lines);
+              return lines;
+          }
+          #endif
+
+          '''
+          edit('runtime/settings.c', 'void settings_save(void) {\n', EXPORT + 'void settings_save(void) {\n')
+
+          # ---- distance sliders -----------------------------------------------------------------------------------------------
+          X = 'runtime/nvn/vulkan/exec.c'
+          edit(X, '    if ((!gd && !cd && !prof) || !g_clip_distance_ok || atomic_load(&pr->state) != 1 || !pr->vi) return 0;\n',
+               '    int gm = g_settings.grass_dist_m, cm = g_settings.char_dist_m, pm = g_settings.prop_dist_m;  // (metres: they win over the steps)\n'
+               '    if ((!gd && !cd && !gm && !cm && !pm && !prof) || !g_clip_distance_ok || atomic_load(&pr->state) != 1 || !pr->vi) return 0;\n')
+          edit(X, '    if (grass) return gt[gd];\n    return skinned ? ct[cd] : 0;\n',
+               '    if (grass) return gm ? (uint8_t)(gm / 2) : gt[gd];\n'
+               '    if (skinned) return cm ? (uint8_t)(cm / 2) : ct[cd];\n'
+               '    if (pm && !rgba && ninst > 1) {  // Object distance: instanced draws that are neither grass, characters nor terrain\n'
+               '        if (prof) cls_stat(st.program->stages[0].code_addr, "prop", count, ninst);\n'
+               '        return (uint8_t)(pm / 2);\n'
+               '    }\n'
+               '    return 0;\n')
+          M = 'runtime/ui/menu.mm'
+          edit(M,
+               '"vanish with the rest. Experimental. Applies at once, after a short wait while new shaders build.", false))\n            settings_save();\n',
+               '"vanish with the rest. Experimental. Applies at once, after a short wait while new shaders build.", false))\n            settings_save();\n'
+               '        {   // the same limits in metres (exec.c draw_cull_depth): a value of 30 or more wins over the steps above\n'
+               '            auto metres = [](float x) { int m = (int)(x + 5.0f) / 10 * 10; return m < 30 ? 0 : m; };\n'
+               '            float gv = (float)g_settings.grass_dist_m, cv = (float)g_settings.char_dist_m, pv = (float)g_settings.prop_dist_m;\n'
+               '            if (opt_slider("Grass distance (metres)", &gv, 0, 300, 10, 0, "%.0f m",\n'
+               '                           "Grass farther than this is not drawn (0 below 30: use the steps above). Each new value builds its shaders "\n'
+               '                           "again, so the screen stutters for a moment after you change it.")) {\n'
+               '                g_settings.grass_dist_m = metres(gv);\n'
+               '                settings_save();\n'
+               '            }\n'
+               '            if (opt_slider("Character distance (metres)", &cv, 0, 300, 10, 0, "%.0f m",\n'
+               '                           "Enemies, NPCs and animals (the meshes with bones) farther than this are not drawn. Link is always near, so "\n'
+               '                           "he stays. 0 below 30: use the steps above. A far horse or quest character can vanish with them.")) {\n'
+               '                g_settings.char_dist_m = metres(cv);\n'
+               '                settings_save();\n'
+               '            }\n'
+               '            if (opt_slider("Object distance (metres, experimental)", &pv, 0, 300, 10, 0, "%.0f m",\n'
+               '                           "Instanced objects that are not grass, characters or terrain (the things repeated across the world) farther "\n'
+               '                           "than this are not drawn: a draw-level stand-in for the game\'s own LOD distance, which is not reachable "\n'
+               '                           "from here. It may cut things you want; 0 is off. The Frame profiler lists what it hits as [clsstat] prop.")) {\n'
+               '                g_settings.prop_dist_m = metres(pv);\n'
+               '                settings_save();\n'
+               '            }\n'
+               '        }\n')
+          edit(M,
+               '            if (armed == 2) settings_reset_all(), settings_save(), armed = 0;\n            else armed = 2, armed_at = now;\n        }\n',
+               '            if (armed == 2) settings_reset_all(), settings_save(), armed = 0;\n            else armed = 2, armed_at = now;\n        }\n'
+               '        static char xport[48];\n'
+               '        static uint32_t xport_at;\n'
+               '        if (xport[0] && now - xport_at > 6000) xport[0] = 0;\n'
+               '        if (opt_action("Export settings", xport,\n'
+               '                       "Copies your settings to the clipboard as text: keep it in a note, or send it to move them to another phone. "\n'
+               '                       "What belongs to this phone (GPU and driver options, game files, mods, language) is left out.")) {\n'
+               '            snprintf(xport, sizeof xport, "%s", settings_export_clipboard() ? "Copied" : "Nothing to copy");\n'
+               '            xport_at = now;\n'
+               '        }\n'
+               '        if (opt_action("Import settings", xport,\n'
+               '                       "Applies settings you copied with Export settings (it reads the clipboard). Options that apply when the game "\n'
+               '                       "starts need a restart. What belongs to this phone is ignored.")) {\n'
+               '            int n = settings_import_clipboard();\n'
+               '            if (n > 0) snprintf(xport, sizeof xport, "%d settings applied", n);\n'
+               '            else snprintf(xport, sizeof xport, "Nothing to import");\n'
+               '            xport_at = now;\n'
+               '        }\n')
+
+          # ---- shorter log ----------------------------------------------------------------------------------------------------
+          edit(X, '            double ms = (t[i + 1] - t[i]) * per;\n',
+               '            double ms = (t[i + 1] - t[i]) * per;\n            if (ms < 0.1) continue;  // (rows under 0.1 ms are most of the lines)\n')
+          edit(X, '    if (last_t && now - last_t > 50000000) {\n        uint64_t dt = now - last_t, ex = cum_exec - l_exec, wt = cum_wait - l_wait;\n        LOG("[hitch] frame',
+               '    if (last_t && now - last_t > 50000000) {\n        uint64_t dt = now - last_t, ex = cum_exec - l_exec, wt = cum_wait - l_wait;\n'
+               '        static uint64_t win_t, win_n, win_more;  // (at 12 fps every frame is over 50 ms: 5 lines in 10 s, then how many more)\n'
+               '        if (now - win_t > 10000000000ull) {\n'
+               '            if (win_more) LOG("[hitch] (%llu more frames over 50 ms in the last 10 s)\\n", (unsigned long long)win_more);\n'
+               '            win_t = now, win_n = 0, win_more = 0;\n'
+               '        }\n'
+               '        if (++win_n > 5) win_more++;\n'
+               '        else LOG("[hitch] frame')
+          print('round 4 applied')
+          PY_ROUND4
+          python3 /tmp/round4.py
+
       - name: Make this a separate app (so your installed one is not replaced)
         run: |
           sed -i 's|applicationId = "com.botwrecomp.android"|applicationId = "com.botwrecomp.android.test"|' android/botwrecompandroid/app/build.gradle.kts
