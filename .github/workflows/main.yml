@@ -1139,6 +1139,187 @@ jobs:
           python3 /tmp/round3.py
           git diff --stat
 
+      - name: Apply more options (reflection and shadow update rate, pipeline cache limit, device profiles, reset)
+        run: |
+          cat > /tmp/round4.py <<'PY_ROUND4'
+          # Round 4, after the extra-options step. Run from the repository root.
+          #   Reflection update rate   the 64x64 cubemap pass the logs show is drawn every 2nd / 4th frame
+          #   Shadow update rate       the depth-only passes (not screen-shaped) likewise
+          #   Pipeline cache limit     how many pipelines are kept (Adreno: none destroyed unless the RAM is low)
+          #   Texture sharpness        a Sharper step
+          #   Device profile, reset    one tap over the options added so far
+          def edit(path, old, new, count=1):
+              s = open(path, encoding='utf-8').read()
+              assert s.count(old) == count, (path, 'anchor found %d times' % s.count(old), old[:80])
+              open(path, 'w', encoding='utf-8').write(s.replace(old, new))
+
+          # ---- settings ---------------------------------------------------------------------------------------------------------
+          edit('runtime/settings.h', '    bool vk_prof;',
+               r'''    int refl_rate;        // Reflection update rate: 0 every frame, 1 every 2nd, 2 every 4th (exec.c stale_pass: cubemap targets)
+              int shadow_rate;      // Shadow update rate: the same, for depth-only passes that are not screen-shaped
+              int pipe_limit;       // Pipeline cache limit: 0 automatic, 750 / 1500 / 3000, 99999 none destroyed; read once at the start (exec.c pipe_keep)
+              bool vk_prof;''')
+          edit('runtime/settings.c', 'g_settings.mip_bias = v < 0 ? 0 : v > 3 ? 3 : v; }', 'g_settings.mip_bias = v < 0 ? 0 : v > 4 ? 4 : v; }')
+          edit('runtime/settings.c',
+               '        else if (!strcmp(key, "thermal_res")) g_settings.thermal_res = atoi(val) != 0;\n',
+               '        else if (!strcmp(key, "thermal_res")) g_settings.thermal_res = atoi(val) != 0;\n' + r'''        else if (!strcmp(key, "refl_rate")) { int v = atoi(val); g_settings.refl_rate = v < 0 ? 0 : v > 2 ? 2 : v; }
+                  else if (!strcmp(key, "shadow_rate")) { int v = atoi(val); g_settings.shadow_rate = v < 0 ? 0 : v > 2 ? 2 : v; }
+                  else if (!strcmp(key, "pipe_limit")) { int v = atoi(val); g_settings.pipe_limit = v == 750 || v == 1500 || v == 3000 || v == 99999 ? v : 0; }
+          ''')
+          edit('runtime/settings.c',
+               '    fprintf(f, "mip_bias = %d\\nthermal_res = %d\\n", g_settings.mip_bias, g_settings.thermal_res);\n',
+               '    fprintf(f, "mip_bias = %d\\nthermal_res = %d\\n", g_settings.mip_bias, g_settings.thermal_res);\n'
+               '    fprintf(f, "refl_rate = %d\\nshadow_rate = %d\\npipe_limit = %d\\n", g_settings.refl_rate, g_settings.shadow_rate, g_settings.pipe_limit);\n')
+          edit('runtime/settings.c', '    g_settings.thermal_res = d->thermal_res;\n',
+               '    g_settings.thermal_res = d->thermal_res;\n    g_settings.refl_rate = d->refl_rate;\n    g_settings.shadow_rate = d->shadow_rate;\n    g_settings.pipe_limit = d->pipe_limit;\n')
+
+          # ---- texture sharpness: Sharper ---------------------------------------------------------------------------------------
+          edit('runtime/nvn/vulkan/textures.c',
+               '        si.mipLodBias += 0.5f * (float)g_settings.mip_bias;  // (samplers are made once: the next start)\n',
+               '        si.mipLodBias += g_settings.mip_bias == 4 ? -0.5f : 0.5f * (float)g_settings.mip_bias;  // (4: Sharper; samplers are made once: the next start)\n')
+
+          # ---- pipeline cache limit ---------------------------------------------------------------------------------------------
+          X = 'runtime/nvn/vulkan/exec.c'
+          edit(X, '        keep = e ? atoi(e) : (g_vk.props.vendorID != 0x5143 || vk_low_ram()) ? 1500 : 0;\n',
+               '        keep = e ? atoi(e) : (g_vk.props.vendorID != 0x5143 || vk_low_ram()) ? 1500 : 0;\n' + r'''#ifdef __ANDROID__
+                  if (!e && g_settings.pipe_limit) keep = g_settings.pipe_limit == 99999 ? 0 : g_settings.pipe_limit;  // (Video > Performance > Pipeline cache limit)
+          #endif
+          ''')
+
+          # ---- reflection and shadow update rate --------------------------------------------------------------------------------
+          edit(X, 'static uint64_t prof_tp_;\n',
+               r'''#ifdef __ANDROID__
+          // Video > Performance > Reflection update rate, Shadow update rate: a pass that renders into a cubemap (the reflection
+          // probe: the logs show a 64x64 RGBA16F one, up to ~150 draws, ~1.8 ms a frame) or into a depth map alone that is not
+          // screen-shaped (the shadow maps) runs every 2nd or 4th frame only. On the frames between, its clears and its draws
+          // both wait - no pass begins, and the attachments (always stored) keep what the last one drew. A target is drawn the
+          // first time it is seen, so a new one is never empty. A guess at what the passes are: Off in the menu is the default.
+          static bool stale_pass(void) {
+              int rr = g_settings.refl_rate, sr = g_settings.shadow_rate;
+              if (!rr && !sr) return false;
+              static const NvnTexture *seen[2][32];
+              static int nseen[2];
+              const NvnTexture *t = NULL;
+              int cls = -1, n = 1;
+              if (st.rt.ncolor >= 1 && st.rt.color[0] && st.rt.color[0]->target == 8) {  // (NVN cubemap)
+                  cls = 0, t = st.rt.color[0], n = rr == 1 ? 2 : rr == 2 ? 4 : 1;
+              } else if (st.rt.ncolor == 0 && st.rt.depth) {
+                  const NvnTexture *d = st.rt.depth;
+                  float a = d->height ? (float)d->width / (float)d->height : 0.0f;
+                  if (a >= 1.74f && a <= 1.81f) return false;  // (screen-shaped: not a shadow map)
+                  cls = 1, t = d, n = sr == 1 ? 2 : sr == 2 ? 4 : 1;
+              }
+              if (cls < 0 || n <= 1) return false;
+              bool known = false;
+              for (int i = 0; i < nseen[cls]; i++) if (seen[cls][i] == t) { known = true; break; }
+              if (!known) {
+                  if (nseen[cls] < 32) seen[cls][nseen[cls]++] = t;
+                  return false;
+              }
+              return renderer_present_count() % (uint64_t)n != 0;
+          }
+          #endif
+          static uint64_t prof_tp_;
+          ''')
+          edit(X, '    if (g_settings.skip_shadows && st.rt.depth && st.rt.ncolor == 0) { stat_skipped++; return; }  // (depth-only: the shadow maps)\n',
+               '    if (g_settings.skip_shadows && st.rt.depth && st.rt.ncolor == 0) { stat_skipped++; return; }  // (depth-only: the shadow maps)\n'
+               '    if (stale_pass()) { stat_skipped++; return; }\n')
+          edit(X, '        case CMD_CLEAR_COLOR: {\n            snap_reason = "clear-color"; snapshots_invalidate(NULL);\n',
+               '        case CMD_CLEAR_COLOR: {\n'
+               '#ifdef __ANDROID__\n'
+               '            if (stale_pass()) break;  // (its clear waits as its draws do)\n'
+               '#endif\n'
+               '            snap_reason = "clear-color"; snapshots_invalidate(NULL);\n')
+          edit(X, '        case CMD_CLEAR_DEPTH_STENCIL:\n            snap_reason = "clear-depth"; snapshots_invalidate(NULL);\n',
+               '        case CMD_CLEAR_DEPTH_STENCIL:\n'
+               '#ifdef __ANDROID__\n'
+               '            if (stale_pass()) break;\n'
+               '#endif\n'
+               '            snap_reason = "clear-depth"; snapshots_invalidate(NULL);\n')
+
+          # ---- the menu ---------------------------------------------------------------------------------------------------------
+          M = 'runtime/ui/menu.mm'
+          edit(M, '        static const char *mb[] = {"Normal", "Softer", "Soft", "Softest"};\n'
+                  '        if (opt_choice("Texture sharpness", &g_settings.mip_bias, mb, 4, 0,\n',
+               r'''        static const char *ur[] = {"Every frame", "Every 2nd frame", "Every 4th frame"};
+                  if (opt_choice("Reflection update rate", &g_settings.refl_rate, ur, 3, 0,
+                                 "How often the environment reflection (the small cubemap the game redraws each frame, about 2 ms) is redrawn; between "
+                                 "times it keeps the last one. Slow changes in the sky and light show up a moment late. Experimental. Applies at once.",
+                                 false))
+                      settings_save();
+                  if (opt_choice("Shadow update rate", &g_settings.shadow_rate, ur, 3, 0,
+                                 "How often the shadow maps are redrawn; between times they keep the last ones, so shadows of moving things lag and "
+                                 "can swim when the camera turns. Saves much more than Reflection, and shows more. Experimental. Applies at once.",
+                                 false))
+                      settings_save();
+                  static const char *mb[] = {"Normal", "Softer", "Soft", "Softest", "Sharper"};
+                  if (opt_choice("Texture sharpness", &g_settings.mip_bias, mb, 5, 0,
+          ''')
+          edit(M, 'Softer +0.5, Soft +1, Softest +1.5 levels.', 'Softer +0.5, Soft +1, Softest +1.5 levels; Sharper -0.5 (crisper, more GPU work).')
+
+          PROFILES = r'''    opt_section("Profiles and memory");
+              {   // one tap over the options above: Battery saver, Balanced, Max performance, Quality (= everything at its default)
+                  static const char *pfn[] = {"Custom", "Battery saver", "Balanced", "Max performance", "Quality"};
+                  struct Prof { int fps, dyn, dmin, dtgt, therm, geo, part, tcap, rr, sr; };
+                  static const Prof pf[4] = {{30, 1, 50, 30, 1, 1, 1, 0, 1, 1},      // Battery saver
+                                             {0, 1, 60, 0, 1, 0, 0, 0, 0, 0},        // Balanced
+                                             {30, 1, 40, 30, 1, 2, 1, 1024, 2, 2},   // Max performance
+                                             {0, 0, 0, 0, 0, 0, 0, 0, 0, 0}};        // Quality
+                  int cur = 0;
+                  for (int p = 0; p < 4; p++) {
+                      const Prof &q = pf[p];
+                      if (g_settings.fps_limit == q.fps && (g_settings.res_mode == RES_DYNAMIC) == (q.dyn != 0) &&
+                          (g_settings.dyn_min ? g_settings.dyn_min : 50) == (q.dmin ? q.dmin : 50) && g_settings.dyn_target == q.dtgt &&
+                          g_settings.thermal_res == (q.therm != 0) && g_settings.geo_detail == q.geo && g_settings.particles == q.part &&
+                          g_settings.tex_cap == q.tcap && g_settings.refl_rate == q.rr && g_settings.shadow_rate == q.sr) cur = p + 1;
+                  }
+                  int pi_ = cur;
+                  if (opt_choice("Device profile", &pi_, pfn, 5, 4,
+                                 "Battery saver: 30 fps, dynamic resolution, a little less detail. Balanced: dynamic resolution only. Max performance: "
+                                 "30 fps, the most savings (half the instances, half the particles, textures up to 1024 px, reflections and shadows "
+                                 "every 4th frame). Quality: all of these off. Touches only the rows listed in the Performance sections.", false) &&
+                      pi_ > 0 && pi_ != cur) {
+                      const Prof &q = pf[pi_ - 1];
+                      g_settings.fps_limit = q.fps;
+                      g_settings.res_mode = q.dyn ? RES_DYNAMIC : RES_MATCH;
+                      g_settings.dyn_min = q.dmin == 50 ? 0 : q.dmin;
+                      g_settings.dyn_target = q.dtgt;
+                      g_settings.thermal_res = q.therm != 0;
+                      g_settings.geo_detail = q.geo;
+                      g_settings.particles = q.part;
+                      g_settings.tex_cap = q.tcap;
+                      g_settings.refl_rate = q.rr;
+                      g_settings.shadow_rate = q.sr;
+                      settings_save();
+                  }
+                  static const char *pl[] = {"Automatic", "750", "1500", "3000", "Never destroy"};
+                  static const int pl_v[] = {0, 750, 1500, 3000, 99999};
+                  int li = 0;
+                  for (int i = 0; i < 5; i++) if (pl_v[i] == g_settings.pipe_limit) li = i;
+                  if (opt_choice("Pipeline cache limit", &li, pl, 5, 0,
+                                 "How many compiled graphics pipelines the game keeps; the ones unused longest are destroyed above this and built "
+                                 "again when needed. Fewer saves RAM on long sessions, more avoids the short stalls of rebuilding. Automatic: 1500 on "
+                                 "low RAM, none destroyed otherwise. Restart the game.", false)) {
+                      g_settings.pipe_limit = pl_v[li];
+                      settings_save();
+                  }
+                  if (opt_button("Reset performance extras",
+                                 "Puts every row added in the Performance sections back to its default: the FPS limiter, pacing, dynamic resolution "
+                                 "extras, particles, geometry, textures, caches, render distance, reflection and shadow rates, sharpness.")) {
+                      g_settings.fps_limit = 0; g_settings.pace_mode = 0; g_settings.dyn_min = 0; g_settings.dyn_target = 0;
+                      g_settings.thermal_res = false; g_settings.geo_detail = 0; g_settings.particles = 0; g_settings.no_ambient = false;
+                      g_settings.tex_cap = 0; g_settings.vc_aggressive = false; g_settings.render_dist = 0; g_settings.refl_rate = 0;
+                      g_settings.shadow_rate = 0; g_settings.mip_bias = 0; g_settings.pipe_limit = 0;
+                      settings_save();
+                  }
+              }
+          '''
+          edit(M, '    opt_section("Frame rate tools");\n', PROFILES + '    opt_section("Frame rate tools");\n')
+          print('round 4 applied')
+          PY_ROUND4
+          python3 /tmp/round4.py
+          git diff --stat
+
       - name: Make this a separate app (so your installed one is not replaced)
         run: |
           sed -i 's|applicationId = "com.botwrecomp.android"|applicationId = "com.botwrecomp.android.test"|' android/botwrecompandroid/app/build.gradle.kts
