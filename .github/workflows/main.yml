@@ -2,6 +2,15 @@ name: Build APK (test)
 
 on:
   workflow_dispatch:
+    inputs:
+      app_name:
+        description: "App name under the icon (empty: unchanged)"
+        required: false
+        default: ""
+      icon_url:
+        description: "Link (https) to a square PNG for the app icon (empty: unchanged, or custom/app_icon.png in the repository if it exists)"
+        required: false
+        default: ""
 
 jobs:
   build:
@@ -1320,10 +1329,503 @@ jobs:
           python3 /tmp/round4.py
           git diff --stat
 
+      - name: Apply settings search, recommended settings and reset all
+        run: |
+          cat > /tmp/round5.py <<'PY_ROUND5'
+          # Round 5. Run from the repository root, after the performance steps.
+          #   Settings > Search      finds a Video or Audio row by the words in its name or description (also on the start screen)
+          #   Recommended settings   one tap: the Video and Audio options at their defaults, then a profile for this device
+          #   Reset all settings     everything back to its defaults, except what the install and the phone's drivers depend on
+          def edit(path, old, new, count=1):
+              s = open(path, encoding='utf-8').read()
+              assert s.count(old) == count, (path, 'anchor found %d times' % s.count(old), old[:80])
+              open(path, 'w', encoding='utf-8').write(s.replace(old, new))
+
+          # ---- settings: Reset all ----------------------------------------------------------------------------------------------
+          edit('runtime/settings.h', 'void settings_reset_defaults(void);\n',
+               'void settings_reset_defaults(void);\n'
+               '// Settings > Search > Reset all settings: every option back to its default - the controls, the touch layout, the\n'
+               '// frame rate and the performance rows too. What stays: the language, the one-time notes, the mods turned off, the\n'
+               '// game code and game files choices, RAM saving and the driver compatibility options (a reset must not break a\n'
+               '// setup that works)\n'
+               'void settings_reset_all(void);\n')
+          edit('runtime/settings.c', 'void settings_load(void) {\n    static bool loaded;\n',
+               r'''void settings_reset_all(void) {
+              if (!g_have_defaults) return;
+              Settings keep = g_settings;
+              g_settings = g_defaults;
+              g_settings.language = keep.language;
+              g_settings.aspect_asked = keep.aspect_asked;
+              g_settings.menu_tip_seen = keep.menu_tip_seen;
+              memcpy(g_settings.mods_off, keep.mods_off, sizeof g_settings.mods_off);
+          #ifdef __ANDROID__
+              g_settings.native_code = keep.native_code;
+              g_settings.files_in_place = keep.files_in_place;
+              g_settings.low_ram = keep.low_ram;
+              g_settings.gpu_heap = keep.gpu_heap;
+              g_settings.inplace_reads = keep.inplace_reads;
+              g_settings.turnip_lrz = keep.turnip_lrz;
+              g_settings.heap_file = keep.heap_file;
+              g_settings.log_file = keep.log_file;
+              memcpy(g_settings.gpu_model, keep.gpu_model, sizeof g_settings.gpu_model);
+              memcpy(g_settings.driver_env, keep.driver_env, sizeof g_settings.driver_env);
+          #endif
+          }
+
+          void settings_load(void) {
+              static bool loaded;
+          ''')
+
+          # ---- option rows: the search filter -----------------------------------------------------------------------------------
+          H = 'runtime/ui/option_rows.h'
+          edit(H, 'void opt_end(void);\n',
+               'void opt_end(void);\n'
+               '// Settings > Search: while words are set, a row (any kind) that does not have every word in its name or description\n'
+               '// is not drawn, and section headings are left out; opt_search_set("") ends it. opt_search_inner(true): opt_begin /\n'
+               '// opt_end do nothing, so a page\'s rows can be drawn inside the search page\'s own.\n'
+               'void opt_search_set(const char *words);\n'
+               'void opt_search_inner(bool on);\n')
+          R = 'runtime/ui/option_rows.mm'
+          edit(R, '#include <string>\n', '#include <string>\n#include <vector>\n')
+          edit(R, 'static int g_indent;\n',
+               r'''static int g_indent;
+          static std::vector<std::string> g_terms;  // (opt_search_set: the search's words, lowercase)
+          static bool g_inner;                       // (opt_search_inner)
+          static std::string lower_(const char *s) {
+              std::string t = s ? s : "";
+              for (char &c : t) c = (char)tolower((unsigned char)c);
+              return t;
+          }
+          void opt_search_set(const char *words) {
+              g_terms.clear();
+              std::string cur;
+              for (char c : lower_(words)) {
+                  if (c == ' ') { if (!cur.empty()) g_terms.push_back(cur), cur.clear(); }
+                  else cur += c;
+              }
+              if (!cur.empty()) g_terms.push_back(cur);
+          }
+          void opt_search_inner(bool on) { g_inner = on; }
+          // no row is hidden without words; else every word has to be in the name or the description (English and as shown)
+          static bool opt_hidden(const char *label, const char *desc) {
+              if (g_terms.empty()) return false;
+              std::string hay = lower_(label) + "\n" + lower_(tr(label)) + "\n" + lower_(desc) + "\n" + lower_(desc ? tr(desc) : NULL);
+              for (const std::string &t : g_terms)
+                  if (hay.find(t) == std::string::npos) return true;
+              return false;
+          }
+          ''')
+          edit(R, '    (void)upper;  // (the Sheikah look writes labels as given; option pages pass them in sentence case)\n',
+               '    (void)upper;  // (the Sheikah look writes labels as given; option pages pass them in sentence case)\n'
+               '    if (opt_hidden(label, desc)) { g_row_dragged = false; g_next_disabled = false; return 0; }  // (Settings > Search)\n')
+          edit(R, 'bool opt_radio(const char *label, bool selected, const char *desc) {\n',
+               'bool opt_radio(const char *label, bool selected, const char *desc) {\n'
+               '    if (opt_hidden(label, desc)) { g_next_disabled = false; return false; }\n')
+          edit(R, 'bool opt_text(const char *label, char *buf, size_t cap, const char *hint, const char *desc) {\n',
+               'bool opt_text(const char *label, char *buf, size_t cap, const char *hint, const char *desc) {\n'
+               '    if (opt_hidden(label, desc)) { g_next_disabled = false; return false; }\n')
+          edit(R, 'void opt_section(const char *title) { ui_sheikah_heading(title, g_scale); }\n',
+               'void opt_section(const char *title) {\n    if (!g_terms.empty()) return;  // (Settings > Search: rows only)\n    ui_sheikah_heading(title, g_scale);\n}\n')
+          edit(R, 'void opt_begin(const char *id, float scale) {\n', 'void opt_begin(const char *id, float scale) {\n    if (g_inner) return;\n')
+          edit(R, 'void opt_end(void) {\n', 'void opt_end(void) {\n    if (g_inner) return;\n')
+
+          # ---- the menu: the Search page ----------------------------------------------------------------------------------------
+          M = 'runtime/ui/menu.mm'
+          edit(M, '"Quit", "Mods"};', '"Quit", "Mods", "Search"};')
+          edit(M, '    static const int order[] = {0, 1, 8, 10, 9};  // Video, Audio, Controls, Mods (runtime/mods.c), Quit\n',
+               '    static const int order[] = {0, 1, 8, 10, 11, 9};  // Video, Audio, Controls, Mods (runtime/mods.c), Search, Quit\n')
+          edit(M, '    case 10: mods_tab_draw(scale); break;  // (ui/mods_tab.mm)\n',
+               '    case 10: mods_tab_draw(scale); break;  // (ui/mods_tab.mm)\n    case 11: tab_search(scale); break;\n')
+          edit(M, '    switch (id) {\n    case -1:\n        dl->AddRect(ImVec2(c.x - r, c.y - r * 0.55f)',
+               '    switch (id) {\n    case 11:  // (Search: a magnifying glass)\n'
+               '        dl->AddCircle(ImVec2(c.x - r * 0.15f, c.y - r * 0.15f), r * 0.62f, col, 0, t);\n'
+               '        dl->AddLine(ImVec2(c.x + r * 0.3f, c.y + r * 0.3f), ImVec2(c.x + r * 0.85f, c.y + r * 0.85f), col, t);\n'
+               '        break;\n    case -1:\n        dl->AddRect(ImVec2(c.x - r, c.y - r * 0.55f)')
+          edit(M, 'static void settings_page(int id, float scale, bool in_game, void (*prelaunch)(float)) {\n',
+               r'''#ifdef __ANDROID__
+          // Settings > Search > Recommended settings: the Video and Audio options back to their defaults, then what suits this
+          // phone: dynamic resolution that steps down when it runs hot or short of time, and on a phone with little RAM
+          // (RAM saving on) 30 fps, fewer instances and smaller textures. The controls, saves and drivers stay as they are.
+          static void settings_recommend(void) {
+              settings_reset_defaults();
+              bool low = vk_low_ram();
+              g_settings.thermal_cap = true;
+              g_settings.thermal_res = true;
+              g_settings.res_mode = RES_DYNAMIC;
+              g_settings.dyn_min = low ? 0 : 60;  // (0: 50)
+              g_settings.dyn_target = 0;
+              if (low) {
+                  g_settings.fps_limit = 30;
+                  g_settings.geo_detail = 1;
+                  g_settings.tex_quality = 1;
+                  g_settings.aniso_cap = 4;
+              }
+              settings_save();
+          }
+
+          // Settings > Search: type words to find a Video or Audio row by its name or description; below the box (nothing typed)
+          // the two actions that reach across every page. Each asks to be tapped twice (within 5 s).
+          static void tab_search(float scale) {
+              static char q[64];
+              static int armed;  // 1 Recommended, 2 Reset all
+              static uint32_t armed_at;
+              opt_begin("##search", scale);
+              opt_search_set("");
+              opt_text("Search settings", q, sizeof q, "Type a name or a word",
+                       "Finds the Video and Audio settings by their names and descriptions - every word you type has to be in a row. The rows "
+                       "work here as on their own pages.");
+              if (q[0]) {
+                  opt_search_set(q);
+                  opt_search_inner(true);
+                  tab_display();
+                  tab_audio();
+                  opt_search_inner(false);
+                  opt_search_set("");
+              } else {
+                  opt_section("Quick actions");
+                  uint32_t now = SDL_GetTicks();
+                  if (armed && now - armed_at > 5000) armed = 0;
+                  if (opt_action("Recommended settings", armed == 1 ? "Tap again" : "",
+                                 "Video and Audio back to their defaults, then what suits this phone: dynamic resolution that steps down when it "
+                                 "runs hot, and on a phone with little RAM 30 fps, fewer instances and smaller textures. Controls, saves and "
+                                 "drivers stay.")) {
+                      if (armed == 1) settings_recommend(), armed = 0;
+                      else armed = 1, armed_at = now;
+                  }
+                  if (opt_action("Reset all settings", armed == 2 ? "Tap again" : "",
+                                 "Every option back to its default: video, audio, frame rate, performance, the touch layout and the controls' "
+                                 "options. Stays: the language, the game code and game files choices, mods, RAM saving and the driver "
+                                 "compatibility options. Saves are never touched.")) {
+                      if (armed == 2) settings_reset_all(), settings_save(), armed = 0;
+                      else armed = 2, armed_at = now;
+                  }
+              }
+              opt_end();
+          }
+          #endif
+
+          static void settings_page(int id, float scale, bool in_game, void (*prelaunch)(float)) {
+          ''')
+          print('round 5 applied')
+          PY_ROUND5
+          python3 /tmp/round5.py
+          git diff --stat
+
+      - name: Apply grass density
+        run: |
+          cat > /tmp/round6.py <<'PY_ROUND6'
+          # Round 6: Grass density. Run from the repository root, after round 5.
+          #   Grass draws are found as the Skip grass setting finds them (a vertex shader that reads an RGBA16 texture). An
+          #   instanced grass draw draws 75% / 50% / 25% of its instances. With the Frame profiler on, the first draw of each
+          #   grass shader is listed as a [grassdraw] line (indexed or not, vertex count, instances), whatever the setting.
+          def edit(path, old, new, count=1):
+              s = open(path, encoding='utf-8').read()
+              assert s.count(old) == count, (path, 'anchor found %d times' % s.count(old), old[:80])
+              open(path, 'w', encoding='utf-8').write(s.replace(old, new))
+
+          edit('runtime/settings.h', '    bool vk_prof;',
+               '    int grass_density;    // Grass density: 0 full, 1 75%, 2 50%, 3 25% of the instances of an instanced grass draw (exec.c grass_thin_inst)\n    bool vk_prof;')
+          edit('runtime/settings.c',
+               '        else if (!strcmp(key, "thermal_res")) g_settings.thermal_res = atoi(val) != 0;\n',
+               '        else if (!strcmp(key, "thermal_res")) g_settings.thermal_res = atoi(val) != 0;\n'
+               '        else if (!strcmp(key, "grass_density")) { int v = atoi(val); g_settings.grass_density = v < 0 ? 0 : v > 3 ? 3 : v; }\n')
+          edit('runtime/settings.c',
+               '    fprintf(f, "mip_bias = %d\\nthermal_res = %d\\n", g_settings.mip_bias, g_settings.thermal_res);\n',
+               '    fprintf(f, "mip_bias = %d\\nthermal_res = %d\\n", g_settings.mip_bias, g_settings.thermal_res);\n'
+               '    fprintf(f, "grass_density = %d\\n", g_settings.grass_density);\n')
+          edit('runtime/settings.c', '    g_settings.thermal_res = d->thermal_res;\n',
+               '    g_settings.thermal_res = d->thermal_res;\n    g_settings.grass_density = d->grass_density;\n')
+
+          X = 'runtime/nvn/vulkan/exec.c'
+          edit(X, 'static uint32_t geo_thin_inst(uint32_t n) { return n; }\n#endif\n',
+               'static uint32_t geo_thin_inst(uint32_t n) { return n; }\n'
+               'static uint32_t grass_thin_inst(Prog *pr, uint32_t n, uint32_t count, bool indexed) { (void)pr; (void)count; (void)indexed; return n; }\n#endif\n')
+          edit(X, '    uint32_t k = lv == 1 ? n - n / 4 : n / 2;\n    return k < 8 ? 8 : k;\n}\n',
+               '    uint32_t k = lv == 1 ? n - n / 4 : n / 2;\n    return k < 8 ? 8 : k;\n}\n' + r'''// Video > Performance > Grass density: an instanced grass draw (found as Skip grass finds it) draws 75%, 50% or 25% of its
+          // instances, never under one. It does nothing to a grass draw of one instance. Frame profiler: the first draw of each
+          // grass shader is listed ([grassdraw]: indexed, vertex count, instances) - what a distance setting for grass would need.
+          static uint32_t grass_thin_inst(Prog *pr, uint32_t n, uint32_t count, bool indexed) {
+              int lv = g_settings.grass_density;
+              if (lv <= 0 && !g_settings.vk_prof) return n;
+              if (!draw_is_grass(pr)) return n;
+              if (g_settings.vk_prof) {
+                  static uint64_t seen[48];
+                  static int ns;
+                  uint64_t vs = st.program->stages[0].code_addr;
+                  bool known = false;
+                  for (int i = 0; i < ns; i++) if (seen[i] == vs) { known = true; break; }
+                  if (!known && ns < 48) {
+                      seen[ns++] = vs;
+                      LOG("[grassdraw] vertex shader %llx: %s, %u vertices, %u instances\n", (unsigned long long)vs, indexed ? "indexed" : "not indexed", count, n);
+                  }
+              }
+              if (lv <= 0 || n < 2) return n;
+              uint32_t k = n * (uint32_t)(lv == 1 ? 75 : lv == 2 ? 50 : 25) / 100;
+              return k < 1 ? 1 : k;
+          }
+          ''')
+          edit(X, 'inst = geo_thin_inst((uint32_t)r->x[4] ? (uint32_t)r->x[4] : 1);\n',
+               'inst = grass_thin_inst(pr, geo_thin_inst((uint32_t)r->x[4] ? (uint32_t)r->x[4] : 1), count, false);\n')
+          edit(X, 'inst = geo_thin_inst((uint32_t)r->x[6] ? (uint32_t)r->x[6] : 1);\n',
+               'inst = grass_thin_inst(pr, geo_thin_inst((uint32_t)r->x[6] ? (uint32_t)r->x[6] : 1), count, true);\n')
+
+          M = 'runtime/ui/menu.mm'
+          edit(M, '        static const char *ur[] = {"Every frame", "Every 2nd frame", "Every 4th frame"};\n',
+               r'''        static const char *gdn[] = {"Full", "75%", "50%", "25%"};
+                  if (opt_choice("Grass density", &g_settings.grass_density, gdn, 4, 0,
+                                 "How much of the grass is drawn: an instanced grass draw draws 75%, 50% or 25% of its instances (it is found as Skip "
+                                 "grass finds it). The last instances go, so a whole patch can thin out or go bare instead of every blade thinning. "
+                                 "Not a distance: the game decides what is drawn. With the Frame profiler on, the log shows how the grass is drawn "
+                                 "([grassdraw] lines). Applies at once.", false))
+                      settings_save();
+                  static const char *ur[] = {"Every frame", "Every 2nd frame", "Every 4th frame"};
+          ''')
+          edit(M, 'g_settings.shadow_rate = 0; g_settings.mip_bias = 0; g_settings.pipe_limit = 0;\n',
+               'g_settings.shadow_rate = 0; g_settings.mip_bias = 0; g_settings.pipe_limit = 0; g_settings.grass_density = 0;\n')
+          print('round 6 applied')
+          PY_ROUND6
+          python3 /tmp/round6.py
+          git diff --stat
+
+      - name: Apply grass and character distance
+        run: |
+          cat > /tmp/round7.py <<'PY_ROUND7'
+          # Round 7: Grass distance and Character distance. Run from the repository root, after round 6.
+          #   A vertex shader found to draw grass (Skip grass's test) or a skinned character (an unsigned-integer vertex input:
+          #   bone indices) is translated a second way with gl_ClipDistance[0] = limit - gl_Position.w, so whatever is farther from
+          #   the camera than the limit (w is the depth in game units, taken to be metres) is clipped there: cleanly, a triangle
+          #   across the limit is cut, not stretched. The variant is used once it is built; until then the draw is as it was.
+          def edit(path, old, new, count=1):
+              s = open(path, encoding='utf-8').read()
+              assert s.count(old) == count, (path, 'anchor found %d times' % s.count(old), old[:80])
+              open(path, 'w', encoding='utf-8').write(s.replace(old, new))
+
+          # ---- the key and the translator ---------------------------------------------------------------------------------------
+          edit('runtime/nvn/maxwell/shader.h', '    bool gmem_linear_lookup;  // Qualcomm compute: cached linear GMap lookup avoids its compiler\'s binary-search failure\n',
+               '    bool gmem_linear_lookup;  // Qualcomm compute: cached linear GMap lookup avoids its compiler\'s binary-search failure\n'
+               '    uint8_t cull_depth;       // vertex (GLSL): clip what is farther than this x 2 game units from the camera (gl_ClipDistance on w).\n'
+               '                              // (In the tail padding: the key is the same size, and 0 hashes as before.)\n')
+          edit('runtime/nvn/maxwell/translate.c',
+               '        if (key && key->depth_minus_one) sp(&s, "  gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5f;\\n");\n    } else if (stage == STAGE_FRAGMENT) {\n',
+               '        if (key && key->depth_minus_one) sp(&s, "  gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5f;\\n");\n'
+               '        if (key && key->cull_depth) sp(&s, "  gl_ClipDistance[0] = %d.0 - gl_Position.w;\\n", (int)key->cull_depth * 2);  // (Grass / Character distance)\n'
+               '    } else if (stage == STAGE_FRAGMENT) {\n')
+
+          # ---- the device: is gl_ClipDistance there ------------------------------------------------------------------------------
+          D = 'runtime/nvn/vulkan/device.c'
+          edit(D, 'VkG g_vk;\n', 'VkG g_vk;\nbool g_clip_distance_ok;  // the GPU has shaderClipDistance (enabled below): Grass / Character distance need it\n')
+          edit(D, '    b->shaderClipDistance = h->shaderClipDistance;\n',
+               '    b->shaderClipDistance = h->shaderClipDistance;\n    g_clip_distance_ok = h->shaderClipDistance != 0;\n')
+
+          # ---- settings ---------------------------------------------------------------------------------------------------------
+          edit('runtime/settings.h', '    bool vk_prof;',
+               '    int grass_dist;       // Grass distance: 0 normal, 1..4 a limit of 120 / 80 / 50 / 30 m (exec.c draw_cull_depth)\n'
+               '    int char_dist;        // Character distance: 0 normal, 1..4 a limit of 150 / 100 / 70 / 50 m, for skinned meshes\n'
+               '    bool vk_prof;')
+          edit('runtime/settings.c', '        else if (!strcmp(key, "grass_density"))',
+               '        else if (!strcmp(key, "grass_dist")) { int v = atoi(val); g_settings.grass_dist = v < 0 ? 0 : v > 4 ? 4 : v; }\n'
+               '        else if (!strcmp(key, "char_dist")) { int v = atoi(val); g_settings.char_dist = v < 0 ? 0 : v > 4 ? 4 : v; }\n'
+               '        else if (!strcmp(key, "grass_density"))')
+          edit('runtime/settings.c', '    fprintf(f, "grass_density = %d\\n", g_settings.grass_density);\n',
+               '    fprintf(f, "grass_density = %d\\ngrass_dist = %d\\nchar_dist = %d\\n", g_settings.grass_density, g_settings.grass_dist, g_settings.char_dist);\n')
+          edit('runtime/settings.c', '    g_settings.grass_density = d->grass_density;\n',
+               '    g_settings.grass_density = d->grass_density;\n    g_settings.grass_dist = d->grass_dist;\n    g_settings.char_dist = d->char_dist;\n')
+
+          # ---- exec.c -----------------------------------------------------------------------------------------------------------
+          X = 'runtime/nvn/vulkan/exec.c'
+          edit(X, '    return k < 1 ? 1 : k;\n}\n',
+               '    return k < 1 ? 1 : k;\n}\n' + r'''// Video > Performance > Grass distance, Character distance: what a draw's vertex shader is. The limits are in game units
+          // (taken to be metres), as the ShaderKey's cull_depth x 2. A character is a vertex shader with an unsigned-integer input
+          // (bone indices). Depth-only passes count when they are screen-shaped (the depth pre-pass must cut where the colour pass
+          // does); the shadow maps are left alone. Frame profiler: each such vertex shader is listed once as [skinvs] / [grassvs].
+          extern bool g_clip_distance_ok;
+          static int draw_cull_depth(Prog *pr, const ShaderKey *vkey) {
+              int gd = g_settings.grass_dist, cd = g_settings.char_dist;
+              bool prof = g_settings.vk_prof;
+              if ((!gd && !cd && !prof) || !g_clip_distance_ok || atomic_load(&pr->state) != 1 || !pr->vi) return 0;
+              if (st.rt.ncolor < 1) {
+                  if (!st.rt.depth || !st.rt.depth->height) return 0;
+                  float a = (float)st.rt.depth->width / (float)st.rt.depth->height;
+                  if (!(a >= 1.74f && a <= 1.81f)) return 0;
+              }
+              bool grass = draw_is_grass(pr);
+              bool skinned = false;
+              if (!grass) for (int i = 0; i < 32; i++) if (vkey->attr_kind[i] == 2) { skinned = true; break; }
+              if (prof && (grass || skinned)) {
+                  static uint64_t seen[96];
+                  static int ns;
+                  uint64_t vs = st.program->stages[0].code_addr;
+                  bool known = false;
+                  for (int i = 0; i < ns; i++) if (seen[i] == vs) { known = true; break; }
+                  if (!known && ns < 96) {
+                      seen[ns++] = vs;
+                      LOG("[%s] vertex shader %llx: %d attributes, depth-only %d\n", grass ? "grassvs" : "skinvs", (unsigned long long)vs, st.nattrib,
+                          st.rt.ncolor < 1);
+                  }
+              }
+              static const uint8_t gt[5] = {0, 60, 40, 25, 15}, ct[5] = {0, 75, 50, 35, 25};
+              if (grass) return gt[gd];
+              return skinned ? ct[cd] : 0;
+          }
+          ''')
+          edit(X, '    Prog *pr = get_program(st.program, &vkey, &fkey);\n    bool keep = false;',
+               '    Prog *pr = get_program(st.program, &vkey, &fkey);\n' + r'''#ifdef __ANDROID__
+              if (pr && (g_settings.grass_dist || g_settings.char_dist || g_settings.vk_prof)) {
+                  int cdv = draw_cull_depth(pr, &vkey);
+                  if (cdv) {  // (the variant with the limit, once it is built; until then the draw is as it was)
+                      ShaderKey ck = vkey;
+                      ck.cull_depth = (uint8_t)cdv;
+                      Prog *cp = get_program(st.program, &ck, &fkey);
+                      if (cp && atomic_load(&cp->state) == 1) pr = cp;
+                  }
+              }
+          #endif
+              bool keep = false;''')
+
+          # ---- the menu ---------------------------------------------------------------------------------------------------------
+          M = 'runtime/ui/menu.mm'
+          edit(M, '        static const char *ur[] = {"Every frame", "Every 2nd frame", "Every 4th frame"};\n',
+               r'''        static const char *dd[] = {"Normal", "Long", "Medium", "Short", "Very short"};
+                  if (opt_choice("Grass distance", &g_settings.grass_dist, dd, 5, 0,
+                                 "How far away grass is drawn: Long 120, Medium 80, Short 50, Very short 30 metres (the game's units, taken as "
+                                 "metres). Farther grass is cut off at that line. If grass goes missing at your feet, the units are not metres: set "
+                                 "Normal and tell me. Needs a GPU with clip distance (nearly all). Applies at once, after a short wait while new "
+                                 "shaders build.", false))
+                      settings_save();
+                  if (opt_choice("Character distance", &g_settings.char_dist, dd, 5, 0,
+                                 "How far away characters and animals (the meshes with bones: enemies, NPCs, wildlife) are drawn: Long 150, Medium "
+                                 "100, Short 70, Very short 50 metres. A guess at which shaders those are - a far horse or a quest character can "
+                                 "vanish with the rest. Experimental. Applies at once, after a short wait while new shaders build.", false))
+                      settings_save();
+                  static const char *ur[] = {"Every frame", "Every 2nd frame", "Every 4th frame"};
+          ''')
+          edit(M, 'g_settings.pipe_limit = 0; g_settings.grass_density = 0;\n',
+               'g_settings.pipe_limit = 0; g_settings.grass_density = 0; g_settings.grass_dist = 0; g_settings.char_dist = 0;\n')
+          print('round 7 applied')
+          PY_ROUND7
+          python3 /tmp/round7.py
+          git diff --stat
+
       - name: Make this a separate app (so your installed one is not replaced)
         run: |
           sed -i 's|applicationId = "com.botwrecomp.android"|applicationId = "com.botwrecomp.android.test"|' android/botwrecompandroid/app/build.gradle.kts
           grep -n applicationId android/botwrecompandroid/app/build.gradle.kts
+
+      - name: Custom app name and icon (optional)
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+          ICON_URL: ${{ inputs.icon_url }}
+        run: |
+          cat > /tmp/app_identity.py <<'PY_IDENTITY'
+          # Optional: the app's name and icon. Run from the repository root.
+          #   APP_NAME   the name under the icon (empty: unchanged)
+          #   ICON_URL   a link to a square PNG (empty: unchanged unless custom/app_icon.png is in the repository)
+          # The icon is written as an adaptive icon (your picture over its own edge colour) and as the plain one for older Androids,
+          # under the names the manifest already uses, so nothing else has to change.
+          import os, re, sys, glob, io, urllib.request
+          from xml.sax.saxutils import escape
+
+          name = os.environ.get('APP_NAME', '').strip()
+          icon_url = os.environ.get('ICON_URL', '').strip()
+          icon_file = 'custom/app_icon.png'
+          app = None
+          for cand in glob.glob('android/**/src/main/AndroidManifest.xml', recursive=True):
+              app = os.path.dirname(cand)
+              break
+          if not app:
+              print('::warning::no AndroidManifest.xml found under android/: the name and icon stay as they are')
+              sys.exit(0)
+          res = os.path.join(app, 'res')
+          manifest_path = os.path.join(app, 'AndroidManifest.xml')
+          manifest = open(manifest_path, encoding='utf-8').read()
+
+          # ---- the name ---------------------------------------------------------------------------------------------------------
+          if name:
+              done = 0
+              android_str = name.replace('\\', '\\\\').replace("'", "\\'").replace('"', '\\"')
+              if android_str[:1] in '@?':
+                  android_str = '\\' + android_str
+              for f in glob.glob(os.path.join(res, 'values*', '*.xml')):
+                  s = open(f, encoding='utf-8').read()
+                  n = re.sub(r'(<string\s+name="app_name"[^>]*>)[^<]*(</string>)', lambda m: m.group(1) + escape(android_str) + m.group(2), s)
+                  if n != s:
+                      open(f, 'w', encoding='utf-8').write(n)
+                      done += 1
+              # a label written straight into the manifest (not a @string reference)
+              def lit(m):
+                  return m.group(0) if m.group(2).startswith('@') else m.group(1) + escape(name, {'"': '&quot;'}) + '"'
+              m2 = re.sub(r'(android:label=")([^"]*)"', lit, manifest)
+              if m2 != manifest:
+                  manifest = m2
+                  open(manifest_path, 'w', encoding='utf-8').write(manifest)
+                  done += 1
+              print('app name "%s": %d place(s) changed' % (name, done))
+              if not done:
+                  print('::warning::no app_name string or literal label found: the name stays as it is')
+
+          # ---- the icon ---------------------------------------------------------------------------------------------------------
+          data = None
+          if os.path.exists(icon_file):
+              data = open(icon_file, 'rb').read()
+              print('icon from', icon_file)
+          elif icon_url:
+              if not icon_url.startswith('https://'):
+                  print('::warning::the icon link must start with https://: the icon stays as it is')
+              else:
+                  try:
+                      req = urllib.request.Request(icon_url, headers={'User-Agent': 'Mozilla/5.0'})
+                      data = urllib.request.urlopen(req, timeout=60).read(20 * 1024 * 1024)
+                      print('icon from', icon_url)
+                  except Exception as e:
+                      print('::warning::could not download the icon (%s): it stays as it is' % e)
+          if data:
+              from PIL import Image
+              src = Image.open(io.BytesIO(data)).convert('RGBA')
+              w, h = src.size
+              side = min(w, h)
+              src = src.crop(((w - side) // 2, (h - side) // 2, (w - side) // 2 + side, (h - side) // 2 + side))  # (centre square)
+              # the names the manifest uses
+              names = set(re.findall(r'android:(?:icon|roundIcon)="@mipmap/([A-Za-z0-9_]+)"', manifest))
+              if not names:
+                  print('::warning::the manifest names no @mipmap icon: the icon stays as it is')
+              else:
+                  # the edge colour: the average of the picture's border pixels that are not see-through (white if none)
+                  px = src.resize((64, 64)).load()
+                  edge = [px[x, y] for x in range(64) for y in range(64) if (x in (0, 63) or y in (0, 63)) and px[x, y][3] > 200]
+                  bg = tuple(sum(c[i] for c in edge) // len(edge) for i in range(3)) if edge else (255, 255, 255)
+                  bg_hex = '#%02X%02X%02X' % bg
+                  # adaptive icon: foreground = the picture at 70% of a transparent 432 px square (the mask shows the middle 66%)
+                  fg = Image.new('RGBA', (432, 432), (0, 0, 0, 0))
+                  inner = src.resize((302, 302), Image.LANCZOS)
+                  fg.paste(inner, (65, 65), inner)
+                  os.makedirs(os.path.join(res, 'drawable-nodpi'), exist_ok=True)
+                  fg.save(os.path.join(res, 'drawable-nodpi', 'custom_icon_fg.png'))
+                  os.makedirs(os.path.join(res, 'values'), exist_ok=True)
+                  open(os.path.join(res, 'values', 'custom_icon.xml'), 'w', encoding='utf-8').write(
+                      '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <color name="custom_icon_bg">%s</color>\n</resources>\n' % bg_hex)
+                  for nm in names:
+                      for old in glob.glob(os.path.join(res, 'mipmap-*', nm + '.*')) + glob.glob(os.path.join(res, 'drawable*', nm + '.*')):
+                          os.remove(old)  # (one icon per name: no duplicate resource)
+                      adaptive = ('<?xml version="1.0" encoding="utf-8"?>\n<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">\n'
+                                  '    <background android:drawable="@color/custom_icon_bg"/>\n    <foreground android:drawable="@drawable/custom_icon_fg"/>\n'
+                                  '</adaptive-icon>\n')
+                      os.makedirs(os.path.join(res, 'mipmap-anydpi-v26'), exist_ok=True)
+                      open(os.path.join(res, 'mipmap-anydpi-v26', nm + '.xml'), 'w', encoding='utf-8').write(adaptive)
+                      for dens, px_ in (('mdpi', 48), ('hdpi', 72), ('xhdpi', 96), ('xxhdpi', 144), ('xxxhdpi', 192)):
+                          d = os.path.join(res, 'mipmap-' + dens)
+                          os.makedirs(d, exist_ok=True)
+                          img = Image.new('RGBA', (px_, px_), bg + (255,))
+                          small = src.resize((px_, px_), Image.LANCZOS)
+                          img.paste(small, (0, 0), small)
+                          if nm.endswith('round'):  # (a round one)
+                              mask = Image.new('L', (px_ * 4, px_ * 4), 0)
+                              from PIL import ImageDraw
+                              ImageDraw.Draw(mask).ellipse((0, 0, px_ * 4 - 1, px_ * 4 - 1), fill=255)
+                              img.putalpha(mask.resize((px_, px_), Image.LANCZOS))
+                          img.save(os.path.join(d, nm + '.png'))
+                  print('icon written for:', ', '.join(sorted(names)), 'edge colour', bg_hex)
+          PY_IDENTITY
+          python3 /tmp/app_identity.py
 
       - name: Restore the signing key (so new builds can update the old one)
         id: signkey
