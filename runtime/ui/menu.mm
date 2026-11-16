@@ -641,7 +641,10 @@ static void tab_display(void) {
                  "GPU works more. Needs your own Lossless.dll from Lossless Scaling for Windows (not included): put it "
                  "in Download/, LSFG/, Documents/Emulation/bios/ or the app's files."),
                  tr("Lossless.dll"), dll ? dll : tr("not found"), tr("State"),
-                 st == 1 ? tr("generating") : st == 0 ? tr("off") : st == 2 ? tr("on, waiting for a steady frame rate") : why);
+                 st == 1 ? tr("generating") : st == 0 ? tr("off") : st == 2 ? tr("on, waiting for a steady frame rate")
+                 : st == 3 ? tr("on, but none fit: the screen refreshes too few times between the game's frames - a higher "
+                                "refresh rate in the phone's display (or game) settings, or a lower Frame rate here, makes room")
+                 : why);
         opt_toggle("Frame generation (LSFG)", &g_settings.lsfg, false, d);
         if (g_settings.lsfg) {
             opt_indent(1);
@@ -660,6 +663,16 @@ static void tab_display(void) {
                            "The resolution the motion between frames is measured at, as a share of the game's image: lower "
                            "is lighter for the GPU, higher follows small details better.", false))
                 g_settings.lsfg_flow = flow_v[fl];
+            {   // (a copy in the app's own files: read without Android's All files access, #437 #385)
+                void launcher_pick_lsfg_dll(void);
+                std::string launcher_lsfg_import_msg(void);
+                std::string m = launcher_lsfg_import_msg();
+                char id[900];
+                snprintf(id, sizeof id, "%s%s%s", tr("Picks your Lossless.dll with Android's file picker and keeps a copy "
+                         "in the app's own files, which the app can always read - for when it says it can't open the "
+                         "file where you put it."), m.empty() ? "" : "\n\n", m.c_str());
+                if (opt_button("Import Lossless.dll", id)) launcher_pick_lsfg_dll();
+            }
             opt_indent(-1);
         }
     }
